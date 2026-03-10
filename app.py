@@ -388,6 +388,9 @@ def main():
 
     if load_clicked:
         st.session_state["active_stock"] = stock
+    # Auto-load the selected ticker on first visit so the app shows content immediately
+    elif st.session_state["active_stock"] is None and stock:
+        st.session_state["active_stock"] = stock
 
     active_stock = st.session_state["active_stock"]
 
