@@ -1,0 +1,661 @@
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import BollingerBands
+
+
+DOWNLOAD_DELAY = 2.0
+RATE_LIMIT_WAIT = 60
+MAX_RETRIES = 2
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_default_symbols() -> list[str]:
+    csv_path = Path("stockList.csv")
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        if "Symbol" in df.columns:
+            return sorted(df["Symbol"].dropna().astype(str).str.strip().unique().tolist())
+    return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def download_data(stock: str) -> pd.DataFrame:
+    data = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            data = yf.download(
+                stock,
+                period="6mo",
+                interval="1h",
+                progress=False,
+                auto_adjust=False,
+            )
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if "rate limit" in err_msg or "too many requests" in err_msg:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RATE_LIMIT_WAIT)
+                    continue
+                return pd.DataFrame()
+            raise
+
+        if data is not None and not data.empty:
+            return data
+
+        if attempt < MAX_RETRIES:
+            time.sleep(RATE_LIMIT_WAIT)
+
+    return pd.DataFrame()
+
+
+def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
+    data = raw_data.copy()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(1)
+
+    expected_cols = ["Open", "High", "Low", "Close", "Volume"]
+    if all(col == stock for col in data.columns):
+        if len(data.columns) == 6:
+            data = data.iloc[:, :-1]
+        if len(data.columns) == 5:
+            data.columns = expected_cols
+        else:
+            raise ValueError(f"Unexpected columns for {stock}: {list(data.columns)}")
+
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+    data_4h = data.resample("4h").agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+    ).dropna()
+
+    bb_indicator = BollingerBands(close=data_4h["Close"], window=200, window_dev=2)
+    data_4h["BB_High"] = bb_indicator.bollinger_hband()
+    data_4h["BB_Low"] = bb_indicator.bollinger_lband()
+    data_4h["RSI"] = RSIIndicator(data_4h["Close"], window=10).rsi()
+
+    macd_indicator = MACD(data_4h["Close"], window_slow=21, window_fast=8, window_sign=5)
+    data_4h["MACD"] = macd_indicator.macd()
+    data_4h["MACD_Signal"] = macd_indicator.macd_signal()
+
+    return data_4h.dropna()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_financial_metrics(stock: str) -> dict:
+    """
+    Mirror the financial-metric logic from StockPickerComprehensive_v6.check_stocks
+    for a single ticker so the web app matches the report.
+    """
+    ticker = yf.Ticker(stock)
+
+    # Try to get the three core statements
+    try:
+        financials = ticker.financials.T if isinstance(ticker.financials, pd.DataFrame) else pd.DataFrame()
+        balance_sheet = ticker.balance_sheet.T
+        cashflow = ticker.cashflow.T
+    except Exception:
+        return {}
+
+    # Sort from oldest -> newest for consistent multi‑year calculations
+    if not financials.empty:
+        financials = financials.sort_index()
+    if not balance_sheet.empty:
+        balance_sheet = balance_sheet.sort_index()
+    if not cashflow.empty:
+        cashflow = cashflow.sort_index()
+
+    # Load static info dict once (used for market cap, dividend rate, etc.)
+    info: dict = {}
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+
+    # Market cap: prefer fast_info, fall back to info
+    market_cap = None
+    try:
+        fast_info = getattr(ticker, "fast_info", None)
+        market_cap = getattr(fast_info, "market_cap", None) if fast_info is not None else None
+    except Exception:
+        market_cap = None
+    if market_cap is None:
+        market_cap = info.get("marketCap", None)
+
+    metrics: dict[str, object] = {
+        "P/E (3Y Avg)": None,
+        "P/E (1Y)": None,
+        "Revenue Growth (2Y %)": None,
+        "Profit Growth (2Y vs Today)": None,
+        "Shares Outstanding (2Y)": None,
+        "Div Rate (FWD)": None,
+        "FCF Multiple (MC/FCF)": None,
+        "Market Cap": market_cap,
+        "Sector PE": None,
+        "EPS (1Y)": None,
+        "Net Debt": None,
+    }
+
+    # Net income based metrics (P/E and profit growth)
+    if not financials.empty and "Net Income" in financials.columns:
+        ni = financials["Net Income"].dropna()
+
+        # 1-year P/E = Market Cap / last year's profit
+        if len(ni) >= 1 and market_cap is not None:
+            last_profit = ni.iloc[-1]
+            if pd.notnull(last_profit) and last_profit != 0:
+                metrics["P/E (1Y)"] = market_cap / last_profit
+
+        # 3-year average P/E and profit growth vs 2 years ago
+        if len(ni) >= 3:
+            if market_cap is not None:
+                avg_profit = ni.iloc[-3:].mean()
+                if pd.notnull(avg_profit) and avg_profit != 0:
+                    metrics["P/E (3Y Avg)"] = market_cap / avg_profit
+
+            latest_profit = ni.iloc[-1]
+            profit_two_years_ago = ni.iloc[-3]
+            if pd.notnull(latest_profit) and pd.notnull(profit_two_years_ago):
+                if latest_profit > profit_two_years_ago:
+                    metrics["Profit Growth (2Y vs Today)"] = "Up"
+                elif latest_profit < profit_two_years_ago:
+                    metrics["Profit Growth (2Y vs Today)"] = "Down"
+                else:
+                    metrics["Profit Growth (2Y vs Today)"] = "Flat"
+
+    # Revenue growth: today vs 2 years ago
+    if not financials.empty and "Total Revenue" in financials.columns:
+        rev = financials["Total Revenue"].dropna()
+        if len(rev) >= 3:
+            latest_rev = rev.iloc[-1]
+            rev_two_years_ago = rev.iloc[-3]
+            if pd.notnull(latest_rev) and pd.notnull(rev_two_years_ago) and rev_two_years_ago != 0:
+                growth = (latest_rev - rev_two_years_ago) / abs(rev_two_years_ago) * 100
+                metrics["Revenue Growth (2Y %)"] = growth
+
+    # Shares outstanding: buyback / issuing / neutral over last 2 years
+    latest_shares = None
+    if not balance_sheet.empty and "Share Issued" in balance_sheet.columns:
+        shares = balance_sheet["Share Issued"].dropna()
+        if len(shares) >= 3:
+            latest_shares = shares.iloc[-1]
+            shares_two_years_ago = shares.iloc[-3]
+            if pd.notnull(latest_shares) and pd.notnull(shares_two_years_ago) and shares_two_years_ago != 0:
+                change_pct = (latest_shares - shares_two_years_ago) / shares_two_years_ago * 100
+                flag = "Neutral"
+                if change_pct > 5:
+                    flag = "Issuing Shares"
+                elif change_pct < -5:
+                    flag = "Buying Back"
+                metrics["Shares Outstanding (2Y)"] = f"{flag} ({change_pct:.1f}%)"
+                metrics["Shares Latest"] = latest_shares
+
+    # EPS (1Y): Net Income / Shares Issued (latest year)
+    if (
+        not financials.empty
+        and "Net Income" in financials.columns
+        and latest_shares not in (None, 0)
+    ):
+        ni = financials["Net Income"].dropna()
+        if len(ni) >= 1:
+            latest_profit = ni.iloc[-1]
+            if pd.notnull(latest_profit):
+                metrics["EPS (1Y)"] = latest_profit / latest_shares
+
+    # Free cash flow: CFO - capex for last year (match various yfinance column names)
+    if not cashflow.empty:
+        cf_row = cashflow.iloc[-1]
+
+        def _find_val(*names, fallback_substrings=None):
+            for n in names:
+                for idx in cf_row.index:
+                    if str(idx).strip() == str(n).strip():
+                        v = cf_row.loc[idx]
+                        if v is not None and pd.notnull(v):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+            if fallback_substrings:
+                for idx in cf_row.index:
+                    s = str(idx).lower()
+                    if all(sub.lower() in s for sub in fallback_substrings):
+                        v = cf_row.loc[idx]
+                        if v is not None and pd.notnull(v):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+            return None
+
+        cfo = _find_val(
+            "Total Cash From Operating Activities",
+            "Net Cash Provided by Operating Activities",
+            "Net Cash Provided by (Used in) Operating Activities",
+            "Cash From Operating Activities",
+            fallback_substrings=("operating", "cash"),
+        )
+        capex = _find_val(
+            "Capital Expenditures",
+            "Purchase Of Property Plant And Equipment",
+            "Capital Expenditure",
+            "Purchase of Property, Plant and Equipment",
+            fallback_substrings=("capital", "expend"),
+        )
+        if capex is None:
+            capex = _find_val(
+                "Purchase Of Property Plant And Equipment",
+                fallback_substrings=("property", "equipment"),
+            )
+
+        if cfo is not None and capex is not None:
+            fcf = cfo - capex
+            if fcf not in (0, None):
+                metrics["FCF (1Y)"] = fcf
+                if market_cap is not None:
+                    metrics["FCF Multiple (MC/FCF)"] = market_cap / fcf
+
+    # Net debt in dollars (for DCF: enterprise -> equity). yfinance balance sheet returns values in dollars.
+    if not balance_sheet.empty:
+        bs_row = balance_sheet.iloc[-1]
+        def _bs(key, *alt):
+            for k in [key] + list(alt):
+                for idx in bs_row.index:
+                    if str(idx).strip() == str(k).strip():
+                        v = bs_row.loc[idx]
+                        if v is not None and pd.notnull(v):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+            return None
+        lt_debt = _bs("Long Term Debt", "Long-Term Debt")
+        st_debt = _bs("Short Long Term Debt", "Short Term Debt", "Short Long Term Debt")
+        cash = _bs("Cash And Cash Equivalents", "Cash", "Cash Cash Equivalents And Short Term Investments")
+        if any(x is not None for x in (lt_debt, st_debt, cash)):
+            net_debt_dollars = (lt_debt or 0) + (st_debt or 0) - (cash or 0)
+            metrics["Net Debt"] = net_debt_dollars
+
+    # Forward dividend rate (per share, annualised, when available)
+    div_rate_fwd = info.get("dividendRate")
+    if pd.notnull(div_rate_fwd):
+        metrics["Div Rate (FWD)"] = div_rate_fwd
+
+    # Sector PE via simple ETF mapping similar to the report
+    try:
+        sector = info.get("sector")
+        sector_etfs = {
+            "Technology": "XLK",
+            "Healthcare": "XLV",
+            "Financial Services": "XLF",
+            "Consumer Cyclical": "XLY",
+            "Consumer Defensive": "XLP",
+            "Industrials": "XLI",
+            "Utilities": "XLU",
+            "Basic Materials": "XLB",
+            "Energy": "XLE",
+            "Real Estate": "XLRE",
+            "Communication Services": "XLC",
+        }
+        if sector in sector_etfs:
+            sector_t = yf.Ticker(sector_etfs[sector])
+            sector_pe = sector_t.info.get("trailingPE")
+            if pd.notnull(sector_pe):
+                metrics["Sector PE"] = sector_pe
+    except Exception:
+        pass
+
+    return metrics
+
+
+def plot_technicals(stock: str, data: pd.DataFrame):
+    fig, axes = plt.subplots(3, 1, figsize=(12, 6), sharex=True)
+
+    axes[0].plot(data.index, data["Close"], label="Close Price", color="blue")
+    axes[0].plot(data.index, data["BB_High"], label="BB High", color="red", linestyle="--")
+    axes[0].plot(data.index, data["BB_Low"], label="BB Low", color="green", linestyle="--")
+    axes[0].set_title(f"{stock} - Close Price and Bollinger Bands")
+    axes[0].legend(loc="upper left")
+
+    axes[1].plot(data.index, data["RSI"], label="RSI", color="blue")
+    axes[1].axhline(30, color="green", linestyle="--")
+    axes[1].axhline(70, color="red", linestyle="--")
+    axes[1].set_title(f"{stock} - RSI")
+    axes[1].legend(loc="upper left")
+
+    axes[2].plot(data.index, data["MACD"], label="MACD", color="blue")
+    axes[2].plot(data.index, data["MACD_Signal"], label="MACD Signal", color="red")
+    axes[2].set_title(f"{stock} - MACD")
+    axes[2].legend(loc="upper left")
+
+    fig.tight_layout()
+    return fig
+
+
+def main():
+    st.set_page_config(page_title="Stock Technical Dashboard", layout="wide")
+    # Reduce vertical spacing; compact tables
+    st.markdown("""
+        <style>
+        .block-container { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+        div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
+        [data-testid="stDataFrame"] { font-size: 0.9rem; }
+        [data-testid="stDataFrame"] td, [data-testid="stDataFrame"] th { padding: 0.25rem 0.5rem !important; }
+        </style>
+    """, unsafe_allow_html=True)
+    st.title("Stock Technical Dashboard")
+    st.caption("Bollinger Bands (200/2), RSI (10), and MACD (8/21/5) on 4-hour candles.")
+
+    if "favorites" not in st.session_state:
+        st.session_state["favorites"] = []
+    favorites = list(st.session_state["favorites"]) if st.session_state["favorites"] else []
+    favorites = [str(s).strip().upper() for s in favorites if s]
+    symbols = load_default_symbols()
+    if not isinstance(symbols, list):
+        symbols = list(symbols) if symbols else ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"]
+    symbols = [str(s).strip().upper() for s in symbols if s]
+    fav_set = set(favorites)
+    options = favorites + [s for s in symbols if s not in fav_set]
+    if not options:
+        options = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"]
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        selected_stock = st.selectbox("Select stock ticker", options=options, index=0)
+    with col2:
+        custom_stock = st.text_input("Or type custom ticker", value="").strip().upper()
+    with col3:
+        st.write("")  # align button
+        st.write("")
+        load_clicked = st.button("Load chart", type="primary")
+
+    stock = custom_stock if custom_stock else selected_stock
+
+    if "active_stock" not in st.session_state:
+        st.session_state["active_stock"] = None
+
+    if load_clicked:
+        st.session_state["active_stock"] = stock
+
+    active_stock = st.session_state["active_stock"]
+
+    if not active_stock:
+        st.info("Select a stock and click 'Load chart' to view charts, financial metrics, and valuation.")
+        return
+
+    with st.spinner(f"Loading data for {active_stock}..."):
+        raw_data = download_data(active_stock)
+
+    if raw_data.empty:
+        st.error("No data was returned from Yahoo Finance. Try another ticker or retry in a minute.")
+        return
+
+    try:
+        indicator_data = calculate_indicators(raw_data, active_stock)
+    except Exception as exc:
+        st.error(f"Could not calculate indicators for {active_stock}: {exc}")
+        return
+
+    if indicator_data.empty:
+        st.warning("Not enough data points after indicator calculations.")
+        return
+
+    latest = indicator_data.iloc[-1]
+    below_bb_low = latest["Close"] < latest["BB_Low"]
+    rsi_extreme = latest["RSI"] < 30
+    macd_crossover = latest["MACD"] > latest["MACD_Signal"]
+
+    # Fetch financial metrics once for both Financial metrics and Valuation tabs
+    fin = fetch_financial_metrics(active_stock)
+
+    tab_charts, tab_fin, tab_val, tab_fav, tab_explain = st.tabs(["Charts", "Financial metrics", "Valuation", "Favorites", "Explanation"])
+
+    current_price = float(latest["Close"])
+
+    with tab_charts:
+        c0, c1, c2, c3 = st.columns([1, 1, 1, 1])
+        c0.metric("Current price", f"${current_price:.2f}")
+        c1.metric("Below BB Low", "Yes" if below_bb_low else "No")
+        c2.metric("RSI < 30", "Yes" if rsi_extreme else "No")
+        c3.metric("MACD > Signal", "Yes" if macd_crossover else "No")
+        fig = plot_technicals(active_stock, indicator_data)
+        st.pyplot(fig)
+        with st.expander("Last 30 periods (4h)", expanded=False):
+            st.dataframe(
+                indicator_data[["Close", "BB_High", "BB_Low", "RSI", "MACD", "MACD_Signal"]].tail(30),
+                height=280,
+            )
+
+    with tab_fin:
+        st.subheader(f"Financial metrics - {active_stock}")
+        if not fin:
+            st.info("Financial metrics are not available for this ticker right now.")
+        else:
+            fin_pretty: dict[str, object] = {}
+            for k, v in fin.items():
+                if isinstance(v, (int, float)):
+                    if k == "Market Cap" or k == "Net Debt":
+                        av = abs(v)
+                        if av >= 1e9:
+                            fin_pretty[k] = f"{v / 1e9:.1f}B"
+                        elif av >= 1e6:
+                            fin_pretty[k] = f"{v / 1e6:.1f}M"
+                        else:
+                            fin_pretty[k] = f"{v:.1f}"
+                    elif k == "FCF (1Y)":
+                        if abs(v) >= 1e9:
+                            fin_pretty[k] = f"{v / 1e9:.1f}B"
+                        elif abs(v) >= 1e6:
+                            fin_pretty[k] = f"{v / 1e6:.1f}M"
+                        else:
+                            fin_pretty[k] = f"{v:.1f}"
+                    elif k.endswith("(2Y %)") or k.endswith("Growth (2Y %)"):
+                        fin_pretty[k] = f"{v:.1f}%"
+                    else:
+                        fin_pretty[k] = f"{v:.1f}"
+                else:
+                    fin_pretty[k] = v if v is not None else "N/A"
+            # Compact table: current price row + one row per metric
+            rows = [{"Metric": "Current price (latest close)", "Value": f"${current_price:.2f}"}]
+            rows += [{"Metric": k, "Value": str(v)} for k, v in fin_pretty.items()]
+            df_fin = pd.DataFrame(rows)
+            st.dataframe(df_fin, use_container_width=True, height=min(44 * (len(rows) + 1), 400), hide_index=True)
+
+    with tab_val:
+        st.subheader(f"Valuation - {active_stock}")
+        st.metric("Current price (latest close)", f"${current_price:.2f}")
+        if not fin or fin.get("EPS (1Y)") is None:
+            st.info("Valuation inputs are not available (missing Net Income or Shares Issued data).")
+        else:
+            eps = fin.get("EPS (1Y)")
+            st.markdown(f"**M₀ (EPS)**: **{eps:.1f}**")
+
+            v1, v2, v3, v4 = st.columns(4)
+            with v1:
+                g_pct = st.number_input("Growth g (%)", value=10.0, step=0.5, min_value=-50.0, max_value=100.0, key="val_g_pct")
+            with v2:
+                k_multiple = st.number_input("Terminal K", value=15.0, step=1.0, min_value=0.0, key="val_k_multiple")
+            with v3:
+                r_pct = st.number_input("Return r (%)", value=12.0, step=0.5, min_value=0.0, max_value=50.0, key="val_r_pct")
+            with v4:
+                mos_pct = st.number_input("MoS (%)", value=25.0, step=1.0, min_value=0.0, max_value=90.0, key="val_mos_pct")
+
+            g = g_pct / 100.0
+            r = r_pct / 100.0
+            mos = mos_pct / 100.0
+
+            rows = []
+            for years in (1, 5, 10):
+                metric_future = eps * (1 + g) ** years
+                price_future = metric_future * k_multiple
+                fair_value = price_future / (1 + r) ** years if r > -1 else None
+                buy_price = fair_value * (1 - mos) if fair_value is not None else None
+                rows.append(
+                    {
+                        "Horizon (years)": years,
+                        "Price Year X": None if price_future is None else round(price_future, 1),
+                        "Fair Value Today": None if fair_value is None else round(fair_value, 1),
+                        "Buy Price (with MOS)": None if buy_price is None else round(buy_price, 1),
+                    }
+                )
+            val_df = pd.DataFrame(rows)
+            st.dataframe(val_df, hide_index=True)
+
+            # DCF model: enterprise value from FCF, then equity value = EV - Net Debt, then per share
+            fcf_1y = fin.get("FCF (1Y)")
+            shares_latest = fin.get("Shares Latest")
+            net_debt = fin.get("Net Debt")
+
+            if fcf_1y is None or shares_latest in (None, 0):
+                st.info("DCF model not available (missing FCF or share count).")
+            else:
+                # yfinance often reports cash flow in thousands; normalize to dollars for consistent per-share result
+                fcf_scale = 1.0
+                if abs(fcf_1y) > 0 and abs(fcf_1y) < 1e7 and shares_latest > 1e6:
+                    # FCF looks like thousands (e.g. 3e6 for $3B); scale to dollars
+                    fcf_scale = 1000.0
+                fcf_dollars = fcf_1y * fcf_scale
+
+                dcf_horizon = 10
+                dcf_enterprise = 0.0
+                for t in range(1, dcf_horizon + 1):
+                    cf_t = fcf_dollars * (1 + g) ** t
+                    dcf_enterprise += cf_t / (1 + r) ** t
+                cf_n = fcf_dollars * (1 + g) ** dcf_horizon
+                tv = cf_n * k_multiple
+                dcf_enterprise += tv / (1 + r) ** dcf_horizon
+
+                # Convert to equity value (what shareholders get) by subtracting net debt
+                net_debt_dollars = (net_debt or 0) if net_debt is not None else 0
+                dcf_equity = max(0.0, dcf_enterprise - net_debt_dollars)
+                intrinsic_dcf = dcf_equity / shares_latest
+                buy_price_dcf = intrinsic_dcf * (1 - mos)
+
+                dcf_df = pd.DataFrame(
+                    [
+                        {"Metric": "Current price", "Value": f"${current_price:.2f}"},
+                        {"Metric": "DCF Intrinsic (10y)", "Value": f"${round(intrinsic_dcf, 1):.1f}"},
+                        {"Metric": "DCF Buy (with MOS)", "Value": f"${round(buy_price_dcf, 1):.1f}"},
+                    ]
+                )
+                st.markdown("**DCF (10-year; equity = EV − Net Debt)**")
+                st.dataframe(dcf_df, hide_index=True)
+
+    with tab_fav:
+        st.subheader("Favorites")
+        st.caption("Favorites appear at the top of the ticker dropdown. Add the current stock or pick one to load.")
+        fav_list = st.session_state["favorites"]
+        if active_stock and active_stock not in fav_list:
+            if st.button("Add current stock to Favorites", key="add_fav"):
+                st.session_state["favorites"] = fav_list + [active_stock]
+                st.rerun()
+        if active_stock and active_stock in fav_list:
+            st.caption(f"**{active_stock}** is in your favorites.")
+        if not fav_list:
+            st.info("No favorites yet. Load a stock, then click 'Add current stock to Favorites' above.")
+        else:
+            for ticker in fav_list:
+                r1, r2, r3 = st.columns([2, 1, 1])
+                with r1:
+                    st.text(ticker)
+                with r2:
+                    if st.button("Load", key=f"load_fav_{ticker}"):
+                        st.session_state["active_stock"] = ticker
+                        st.rerun()
+                with r3:
+                    if st.button("Remove", key=f"rem_fav_{ticker}"):
+                        st.session_state["favorites"] = [t for t in fav_list if t != ticker]
+                        st.rerun()
+
+    with tab_explain:
+        st.subheader("Explanation of metrics and valuation calculators")
+        st.markdown("This tab explains every metric and calculator used in the app.")
+
+        with st.expander("Charts – Technical indicators", expanded=True):
+            st.markdown("""
+**Data:** 1-hour Yahoo Finance data resampled to **4-hour candles** (last 6 months).
+
+- **Bollinger Bands (BB)**  
+  Upper and lower bands around price (200-period SMA ± 2 standard deviations).  
+  - **Below BB Low:** Price below the lower band is often considered oversold (potential support).  
+  - The chart shows Close price with BB High (red dashed) and BB Low (green dashed).
+
+- **RSI (Relative Strength Index)**  
+  10-period RSI (0–100).  
+  - **RSI &lt; 30:** Oversold; **RSI &gt; 70:** Overbought.  
+  - The chart includes reference lines at 30 (green) and 70 (red).
+
+- **MACD (Moving Average Convergence Divergence)**  
+  Fast 8, slow 21, signal 5 (on 4-hour data).  
+  - **MACD &gt; Signal:** Bullish momentum.  
+  - The chart plots MACD line (blue) and Signal line (red).
+""")
+
+        with st.expander("Financial metrics – Definitions"):
+            st.markdown("""
+- **P/E (3Y Avg):** Market cap ÷ average Net Income over the last three reported fiscal years.  
+- **P/E (1Y):** Market cap ÷ most recent year’s Net Income.  
+- **Revenue Growth (2Y %):** % change in Total Revenue from two years ago to the most recent year.  
+- **Profit Growth (2Y vs Today):** Whether Net Income is **Up**, **Down**, or **Flat** vs. two years ago.  
+- **Shares Outstanding (2Y):** Whether the company is **Issuing Shares**, **Buying Back**, or **Neutral** (based on % change in shares issued over two years; ±5% threshold).  
+- **Div Rate (FWD):** Forward annual dividend per share (when available).  
+- **FCF Multiple (MC/FCF):** Market cap ÷ Free Cash Flow (Cash from Operations − Capital Expenditures, latest year).  
+- **Market Cap:** Current equity market capitalization (share price × shares outstanding).  
+- **Sector PE:** Trailing P/E of a sector ETF (e.g. XLK for Technology, XLV for Healthcare) matching the company’s sector.  
+- **EPS (1Y):** Net Income ÷ shares issued for the most recent fiscal year (used as M₀ in the valuation model).  
+- **Net Debt:** Long-term debt + short-term debt − cash and equivalents (used to convert DCF enterprise value to equity value).  
+- **FCF (1Y):** Free cash flow for the latest year (Cash from Operations − Capital Expenditures); used in the DCF model.
+""")
+
+        with st.expander("Valuation – EPS-based model (5- and 10-year)"):
+            st.markdown("""
+**Starting metric (M₀):** Last fiscal year Net Income per share (EPS).
+
+**Inputs:**  
+- **g:** Estimated annual growth rate of earnings (e.g. 5%, 10%, 15%).  
+- **K:** Terminal multiple (P/E or price-to-FCF) you expect in 5 or 10 years.  
+- **r:** Desired annual return (discount rate), e.g. 10%–15%.  
+- **Margin of safety (MoS):** Cushion (e.g. 25%) applied to fair value to get a buy price.
+
+**Formulas:**  
+- **Price in year X:** $\\text{Price}_X = M_0 \\times (1+g)^X \\times K$  
+- **Fair value today:** $\\text{Fair Value} = \\text{Price}_X \\div (1+r)^X$  
+- **Buy price (with MoS):** $\\text{Buy Price} = \\text{Fair Value} \\times (1 - \\text{MoS})$
+
+The table shows 5-year and 10-year horizons: Price Year X, Fair Value Today, and Buy Price (with MOS).
+""")
+
+        with st.expander("Valuation – DCF model (10-year)"):
+            st.markdown("""
+**Basis:** Free Cash Flow (FCF) for the latest year, grown at rate **g**, discounted at rate **r**, plus a terminal value.
+
+**Formula:**  
+$\\text{DCF} = \\sum_{t=1}^{10} \\frac{\\text{CF}_t}{(1+r)^t} + \\frac{\\text{TV}}{(1+r)^{10}}$  
+where $\\text{CF}_t = \\text{FCF}_{1Y} \\times (1+g)^t$ and $\\text{TV} = \\text{CF}_{10} \\times K$.
+
+**From enterprise value to equity value:**  
+- DCF sum gives **enterprise value** (value of the whole firm).  
+- **Equity value** = Enterprise value − **Net debt** (so debt is accounted for).  
+- **DCF Intrinsic Price** = Equity value ÷ shares outstanding.  
+- **DCF Buy Price (with MOS)** = DCF Intrinsic Price × (1 − Margin of safety).
+
+Uses the same **g**, **r**, **K**, and **Margin of safety** as the EPS-based model. FCF and net debt come from the financial statements.
+""")
+
+        st.caption("Data source: Yahoo Finance. Not investment advice.")
+
+
+if __name__ == "__main__":
+    main()
