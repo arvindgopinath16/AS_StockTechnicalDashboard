@@ -55,6 +55,35 @@ def download_data(stock: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def download_data_for_paper(stock: str, years: int) -> pd.DataFrame:
+    """Download 1h data for paper trading; Yahoo 1h allows up to ~730 days."""
+    period_days = min(730, max(30, int(years * 365)))
+    period = f"{period_days}d"
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            data = yf.download(
+                stock,
+                period=period,
+                interval="1h",
+                progress=False,
+                auto_adjust=False,
+            )
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if "rate limit" in err_msg or "too many requests" in err_msg:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RATE_LIMIT_WAIT)
+                    continue
+                return pd.DataFrame()
+            raise
+        if data is not None and not data.empty:
+            return data
+        if attempt < MAX_RETRIES:
+            time.sleep(RATE_LIMIT_WAIT)
+    return pd.DataFrame()
+
+
 def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
     data = raw_data.copy()
 
@@ -91,6 +120,85 @@ def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
     data_4h["MACD_Signal"] = macd_indicator.macd_signal()
 
     return data_4h.dropna()
+
+
+def run_paper_simulation(
+    df_4h: pd.DataFrame,
+    money_invested: float,
+    pct_taken_out: float,
+) -> dict:
+    """
+    Simulate paper trading on 4h bars.
+    Buy: Close < BB_Low, RSI < 30, MACD crosses above Signal.
+    Sell: Close > BB_High, RSI > 70, MACD crosses below Signal; sell pct_taken_out of position.
+    """
+    total_invested = 0.0
+    shares = 0.0
+    cost_basis = 0.0
+    cash_from_sales = 0.0
+    realized_gain = 0.0
+    events: list = []
+
+    for i in range(1, len(df_4h)):
+        row = df_4h.iloc[i]
+        prev = df_4h.iloc[i - 1]
+        close = float(row["Close"])
+
+        # Buy: below BB low, RSI < 30, MACD just crossed above Signal
+        buy_signal = (
+            close < row["BB_Low"]
+            and row["RSI"] < 30
+            and row["MACD"] > row["MACD_Signal"]
+            and prev["MACD"] <= prev["MACD_Signal"]
+        )
+        if buy_signal:
+            sh = money_invested / close
+            shares += sh
+            cost_basis += money_invested
+            total_invested += money_invested
+            events.append((df_4h.index[i], "Buy", sh, close, money_invested))
+
+        # Sell: above BB high, RSI > 70, MACD just crossed below Signal; sell pct_taken_out of shares
+        sell_signal = (
+            shares > 0
+            and close > row["BB_High"]
+            and row["RSI"] > 70
+            and row["MACD"] < row["MACD_Signal"]
+            and prev["MACD"] >= prev["MACD_Signal"]
+        )
+        if sell_signal:
+            to_sell = shares * pct_taken_out
+            if to_sell > 1e-8:
+                proceeds = to_sell * close
+                cost_of_sold = (to_sell / shares) * cost_basis
+                realized_gain += proceeds - cost_of_sold
+                cash_from_sales += proceeds
+                shares -= to_sell
+                cost_basis -= cost_of_sold
+                events.append((df_4h.index[i], "Sell", to_sell, close, proceeds))
+
+    latest_close = float(df_4h.iloc[-1]["Close"])
+    current_value = shares * latest_close
+    unrealized_gain = current_value - cost_basis
+    final_wealth = cash_from_sales + current_value
+    rate_of_return_pct = (
+        (final_wealth - total_invested) / total_invested * 100.0 if total_invested else 0.0
+    )
+
+    return {
+        "total_invested": total_invested,
+        "realized_gain": realized_gain,
+        "unrealized_gain": unrealized_gain,
+        "current_value": current_value,
+        "cash_from_sales": cash_from_sales,
+        "shares": shares,
+        "cost_basis": cost_basis,
+        "rate_of_return_pct": rate_of_return_pct,
+        "final_wealth": final_wealth,
+        "n_buys": sum(1 for e in events if e[1] == "Buy"),
+        "n_sells": sum(1 for e in events if e[1] == "Sell"),
+        "events": events,
+    }
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -423,7 +531,9 @@ def main():
     # Fetch financial metrics once for both Financial metrics and Valuation tabs
     fin = fetch_financial_metrics(active_stock)
 
-    tab_charts, tab_fin, tab_val, tab_fav, tab_explain = st.tabs(["Charts", "Financial metrics", "Valuation", "Favorites", "Explanation"])
+    tab_charts, tab_fin, tab_val, tab_paper, tab_fav, tab_explain = st.tabs(
+        ["Charts", "Financial metrics", "Valuation", "Paper investing check", "Favorites", "Explanation"]
+    )
 
     current_price = float(latest["Close"])
 
@@ -556,6 +666,66 @@ def main():
                 st.markdown("**DCF (10-year; equity = EV − Net Debt)**")
                 st.dataframe(dcf_df, hide_index=True)
 
+    with tab_paper:
+        st.subheader(f"Paper investing check – {active_stock}")
+        st.caption(
+            "Simulates: buy when price below BB lower band, RSI < 30, and MACD crosses above Signal; "
+            "sell the chosen % when price above BB upper band, RSI > 70, and MACD crosses below Signal. "
+            "Uses 4-hour bars over the selected period."
+        )
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            paper_years = st.number_input("Number of years", value=2, min_value=1, max_value=2, step=1, key="paper_years")
+        with p2:
+            paper_money = st.number_input("Money invested per buy ($)", value=1000.0, min_value=1.0, step=100.0, key="paper_money")
+        with p3:
+            paper_pct = st.number_input("Money taken out (%)", value=10.0, min_value=1.0, max_value=100.0, step=1.0, key="paper_pct")
+        pct_decimal = paper_pct / 100.0
+
+        with st.spinner(f"Loading {paper_years} year(s) of 4h data for {active_stock}..."):
+            raw_paper = download_data_for_paper(active_stock, paper_years)
+        if raw_paper.empty:
+            st.warning("No historical data for this period. Yahoo 1h data is limited to about 2 years.")
+        else:
+            try:
+                paper_4h = calculate_indicators(raw_paper, active_stock)
+            except Exception as exc:
+                st.error(f"Could not compute indicators: {exc}")
+                paper_4h = pd.DataFrame()
+            if paper_4h.empty or len(paper_4h) < 2:
+                st.warning("Not enough 4h bars after computing indicators (need 200+ for BB).")
+            else:
+                res = run_paper_simulation(paper_4h, paper_money, pct_decimal)
+                st.metric("Current price (latest close)", f"${current_price:.2f}")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Realized gain", f"${res['realized_gain']:,.2f}")
+                m2.metric("Unrealized gain", f"${res['unrealized_gain']:,.2f}")
+                m3.metric("Rate of return", f"{res['rate_of_return_pct']:.1f}%")
+                m4.metric("Total invested", f"${res['total_invested']:,.2f}")
+                st.caption(
+                    f"Final wealth: ${res['final_wealth']:,.2f} "
+                    f"(cash from sales: ${res['cash_from_sales']:,.2f}, "
+                    f"current position: ${res['current_value']:,.2f} on {res['shares']:.2f} shares). "
+                    f"Buys: {res['n_buys']}, Sells: {res['n_sells']}."
+                )
+                with st.expander("Buy / sell events", expanded=False):
+                    if not res["events"]:
+                        st.write("No events in this period.")
+                    else:
+                        ev_df = pd.DataFrame(
+                            [
+                                {
+                                    "Time": e[0],
+                                    "Action": e[1],
+                                    "Shares": round(e[2], 4),
+                                    "Price": round(e[3], 2),
+                                    "Amount ($)": round(e[4], 2),
+                                }
+                                for e in res["events"]
+                            ]
+                        )
+                        st.dataframe(ev_df, use_container_width=True, hide_index=True)
+
     with tab_fav:
         st.subheader("Favorites")
         st.caption("Favorites appear at the top of the ticker dropdown. Add the current stock or pick one to load.")
@@ -604,6 +774,21 @@ def main():
   Fast 8, slow 21, signal 5 (on 4-hour data).  
   - **MACD &gt; Signal:** Bullish momentum.  
   - The chart plots MACD line (blue) and Signal line (red).
+""")
+
+        with st.expander("Paper investing check – Simulation rules"):
+            st.markdown("""
+Uses **4-hour bars** over the selected number of years (Yahoo 1h data, up to 2 years).
+
+- **Buy signal (all must be true):** Close below BB lower band (outside 2 std dev), RSI &lt; 30, and MACD crosses **above** MACD Signal.  
+  On each buy, the simulator invests the **Money invested** amount at that bar’s close.
+
+- **Sell signal (all must be true):** Close above BB upper band, RSI &gt; 70, and MACD crosses **below** MACD Signal.  
+  On each sell, the simulator sells **Money taken out %** of the current share position at that bar’s close.
+
+- **Realized gain:** Sum of (sale proceeds − cost basis of shares sold) on all sell events.  
+- **Unrealized gain:** Current value of remaining shares minus their cost basis.  
+- **Rate of return:** (Final wealth − Total invested) ÷ Total invested × 100%, where final wealth = cash from sales + current position value.
 """)
 
         with st.expander("Financial metrics – Definitions"):
