@@ -202,6 +202,96 @@ def run_paper_simulation(
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+def fetch_analyst_view(stock: str) -> dict:
+    """
+    Get analyst consensus and price targets from Yahoo Finance.
+    Returns sentiment: Potential Buy / Neutral / Potential Sell.
+    """
+    out: dict = {
+        "sentiment": None,
+        "recommendation_key": None,
+        "target_mean": None,
+        "target_high": None,
+        "target_low": None,
+        "num_analysts": None,
+        "current_vs_target": None,
+    }
+    try:
+        ticker = yf.Ticker(stock)
+        info = getattr(ticker, "info", None) or {}
+        key = (info.get("recommendationKey") or "").strip().lower()
+        mean_t = info.get("targetMeanPrice")
+        high_t = info.get("targetHighPrice")
+        low_t = info.get("targetLowPrice")
+        n_analysts = info.get("numberOfAnalystOpinions")
+        rec_mean = info.get("recommendationMean")
+
+        if key in ("strong_buy", "buy"):
+            out["sentiment"] = "Potential Buy"
+        elif key in ("sell", "strong_sell"):
+            out["sentiment"] = "Potential Sell"
+        elif key == "hold" or key:
+            out["sentiment"] = "Neutral"
+        elif rec_mean is not None:
+            try:
+                r = float(rec_mean)
+                if r <= 2.0:
+                    out["sentiment"] = "Potential Buy"
+                elif r >= 4.0:
+                    out["sentiment"] = "Potential Sell"
+                else:
+                    out["sentiment"] = "Neutral"
+            except (TypeError, ValueError):
+                out["sentiment"] = "Neutral"
+        else:
+            out["sentiment"] = "—"
+
+        if key:
+            out["recommendation_key"] = key.replace("_", " ").title()
+        if mean_t is not None:
+            try:
+                out["target_mean"] = float(mean_t)
+            except (TypeError, ValueError):
+                pass
+        if high_t is not None:
+            try:
+                out["target_high"] = float(high_t)
+            except (TypeError, ValueError):
+                pass
+        if low_t is not None:
+            try:
+                out["target_low"] = float(low_t)
+            except (TypeError, ValueError):
+                pass
+        if n_analysts is not None:
+            try:
+                out["num_analysts"] = int(n_analysts)
+            except (TypeError, ValueError):
+                pass
+
+        # Optional: get_analyst_price_targets() as fallback for targets
+        if out["target_mean"] is None:
+            try:
+                targets = ticker.get_analyst_price_targets()
+                if isinstance(targets, dict):
+                    out["target_mean"] = targets.get("mean") or targets.get("targetMeanPrice")
+                    out["target_high"] = out["target_high"] or targets.get("high")
+                    out["target_low"] = out["target_low"] or targets.get("low")
+                elif isinstance(targets, pd.DataFrame) and not targets.empty:
+                    if "Mean Target" in targets.columns:
+                        out["target_mean"] = float(targets["Mean Target"].iloc[0])
+                    if "High Target" in targets.columns:
+                        out["target_high"] = float(targets["High Target"].iloc[0])
+                    if "Low Target" in targets.columns:
+                        out["target_low"] = float(targets["Low Target"].iloc[0])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_financial_metrics(stock: str) -> dict:
     """
     Mirror the financial-metric logic from StockPickerComprehensive_v6.check_stocks
@@ -530,9 +620,18 @@ def main():
 
     # Fetch financial metrics once for both Financial metrics and Valuation tabs
     fin = fetch_financial_metrics(active_stock)
+    analyst = fetch_analyst_view(active_stock)
 
-    tab_charts, tab_fin, tab_val, tab_paper, tab_fav, tab_explain = st.tabs(
-        ["Charts", "Financial metrics", "Valuation", "Paper investing check", "Favorites", "Explanation"]
+    tab_charts, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
+        [
+            "Charts",
+            "Financial metrics",
+            "Valuation",
+            "Paper investing check",
+            "Analyst view",
+            "Favorites",
+            "Explanation",
+        ]
     )
 
     current_price = float(latest["Close"])
@@ -726,6 +825,40 @@ def main():
                         )
                         st.dataframe(ev_df, use_container_width=True, hide_index=True)
 
+    with tab_analyst:
+        st.subheader(f"Analyst view – {active_stock}")
+        st.caption(
+            "Consensus and price targets from Yahoo Finance (third‑party analyst data, not a recommendation from this app)."
+        )
+        st.metric("Current price (latest close)", f"${current_price:.2f}")
+
+        sentiment = analyst.get("sentiment") or "—"
+        color = "green" if sentiment == "Potential Buy" else "red" if sentiment == "Potential Sell" else "gray"
+        st.markdown(f"**Analyst sentiment:** :{color}[**{sentiment}**]")
+
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            if analyst.get("recommendation_key"):
+                st.metric("Recommendation (raw)", analyst["recommendation_key"])
+        with a2:
+            if analyst.get("num_analysts") is not None:
+                st.metric("Number of analysts", str(analyst["num_analysts"]))
+        with a3:
+            if analyst.get("target_mean") is not None:
+                mean_t = analyst["target_mean"]
+                vs = "Above" if current_price > mean_t else "Below" if current_price < mean_t else "At"
+                st.metric("Mean price target", f"${mean_t:.2f}", f"{vs} target")
+
+        if analyst.get("target_high") is not None or analyst.get("target_low") is not None:
+            row_targets = [
+                {"Target": "Low", "Price": f"${analyst['target_low']:.2f}" if analyst.get("target_low") is not None else "—"},
+                {"Target": "Mean", "Price": f"${analyst['target_mean']:.2f}" if analyst.get("target_mean") is not None else "—"},
+                {"Target": "High", "Price": f"${analyst['target_high']:.2f}" if analyst.get("target_high") is not None else "—"},
+            ]
+            st.dataframe(pd.DataFrame(row_targets), use_container_width=True, hide_index=True)
+        if (sentiment == "—" and analyst.get("target_mean") is None and not analyst.get("recommendation_key")):
+            st.info("Analyst consensus and price targets are not available for this ticker from the current source.")
+
     with tab_fav:
         st.subheader("Favorites")
         st.caption("Favorites appear at the top of the ticker dropdown. Add the current stock or pick one to load.")
@@ -789,6 +922,15 @@ Uses **4-hour bars** over the selected number of years (Yahoo 1h data, up to 2 y
 - **Realized gain:** Sum of (sale proceeds − cost basis of shares sold) on all sell events.  
 - **Unrealized gain:** Current value of remaining shares minus their cost basis.  
 - **Rate of return:** (Final wealth − Total invested) ÷ Total invested × 100%, where final wealth = cash from sales + current position value.
+""")
+
+        with st.expander("Analyst view – Third-party consensus"):
+            st.markdown("""
+Data in the **Analyst view** tab comes from **Yahoo Finance**, which aggregates analyst ratings and price targets.
+
+- **Analyst sentiment** is mapped from the consensus recommendation: **Potential Buy** (strong buy / buy), **Neutral** (hold), **Potential Sell** (sell / strong sell). This is not a recommendation from this app.
+- **Mean / high / low price targets** are analyst estimates; "Above/Below target" compares the current price to the mean target.
+- Availability varies by ticker; some symbols have little or no analyst data from this source.
 """)
 
         with st.expander("Financial metrics – Definitions"):
