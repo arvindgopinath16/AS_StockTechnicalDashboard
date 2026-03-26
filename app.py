@@ -15,6 +15,40 @@ RATE_LIMIT_WAIT = 60
 MAX_RETRIES = 2
 
 
+def normalize_ohlcv_columns(data: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Yahoo OHLCV data to columns: Open, High, Low, Close, Volume."""
+    expected = ["Open", "High", "Low", "Close", "Volume"]
+    out = data.copy()
+
+    if isinstance(out.columns, pd.MultiIndex):
+        lv0 = [str(c) for c in out.columns.get_level_values(0)]
+        lv1 = [str(c) for c in out.columns.get_level_values(1)]
+        if set(expected).issubset(set(lv0)):
+            out.columns = lv0
+        elif set(expected).issubset(set(lv1)):
+            out.columns = lv1
+        else:
+            # Fallback: try either side of the tuple that matches OHLCV names
+            flat_cols = []
+            for c0, c1 in out.columns.to_list():
+                if str(c0) in expected:
+                    flat_cols.append(str(c0))
+                elif str(c1) in expected:
+                    flat_cols.append(str(c1))
+                else:
+                    flat_cols.append(str(c0))
+            out.columns = flat_cols
+
+    if "Adj Close" in out.columns:
+        out = out.drop(columns=["Adj Close"])
+
+    missing = [c for c in expected if c not in out.columns]
+    if missing:
+        raise ValueError(f"Missing OHLCV columns: {missing}")
+
+    return out[expected]
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_default_symbols() -> list[str]:
     csv_path = Path("stockList.csv")
@@ -85,19 +119,7 @@ def download_data_for_paper(stock: str, years: int) -> pd.DataFrame:
 
 
 def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
-    data = raw_data.copy()
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(1)
-
-    expected_cols = ["Open", "High", "Low", "Close", "Volume"]
-    if all(col == stock for col in data.columns):
-        if len(data.columns) == 6:
-            data = data.iloc[:, :-1]
-        if len(data.columns) == 5:
-            data.columns = expected_cols
-        else:
-            raise ValueError(f"Unexpected columns for {stock}: {list(data.columns)}")
+    data = normalize_ohlcv_columns(raw_data)
 
     data.index = pd.to_datetime(data.index).tz_localize(None)
     data_4h = data.resample("4h").agg(
@@ -127,16 +149,7 @@ def calculate_reversal_confidence(raw_data: pd.DataFrame, stock: str) -> dict:
     Confidence score for potential reversal (0-100), based on:
     OBV divergence, 30-day POC, volume bar strength, and VWAP.
     """
-    data = raw_data.copy()
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(1)
-
-    expected_cols = ["Open", "High", "Low", "Close", "Volume"]
-    if all(col == stock for col in data.columns):
-        if len(data.columns) == 6:
-            data = data.iloc[:, :-1]
-        if len(data.columns) == 5:
-            data.columns = expected_cols
+    data = normalize_ohlcv_columns(raw_data)
 
     data.index = pd.to_datetime(data.index).tz_localize(None)
     daily = data.resample("1D").agg(
@@ -624,6 +637,23 @@ def plot_technicals(stock: str, data: pd.DataFrame):
     return fig
 
 
+def plot_reversal_scorecard(scores: dict, total: int, label: str):
+    fig, ax = plt.subplots(figsize=(8, 2.6))
+    crit = list(scores.keys())
+    vals = [scores[k] for k in crit]
+    colors = ["#2ca02c" if v > 0 else "#d62728" for v in vals]
+
+    ax.barh(crit, vals, color=colors, alpha=0.9)
+    ax.set_xlim(0, 25)
+    ax.set_xlabel("Score per criterion (0 or 25)")
+    ax.set_title(f"Reversal Confidence Scorecard: {total}/100 ({label})")
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    for y, v in enumerate(vals):
+        ax.text(v + 0.5, y, str(v), va="center", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+
 def main():
     st.set_page_config(page_title="Stock Technical Dashboard", layout="wide")
     # Reduce vertical spacing; compact tables
@@ -728,6 +758,10 @@ def main():
         r1, r2 = st.columns([1, 2])
         r1.metric("Reversal confidence", f"{reversal_conf['total']}/100")
         r2.metric("Confidence label", reversal_conf["label"])
+        score_fig = plot_reversal_scorecard(
+            reversal_conf["scores"], reversal_conf["total"], reversal_conf["label"]
+        )
+        st.pyplot(score_fig)
         comp_df = pd.DataFrame(
             [{"Criterion": k, "Score": v} for k, v in reversal_conf["scores"].items()]
         )
