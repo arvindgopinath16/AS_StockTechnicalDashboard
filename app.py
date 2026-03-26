@@ -654,6 +654,132 @@ def plot_reversal_scorecard(scores: dict, total: int, label: str):
     return fig
 
 
+def compute_reversal_diagnostics(raw_data: pd.DataFrame, stock: str) -> dict | None:
+    """
+    Compute the underlying numeric pieces used by the reversal confidence score.
+    Returns:
+      - daily dataframe (1D resample)
+      - poc_price (scalar)
+      - vwap_30 (scalar)
+      - avg20_vol (scalar)
+      - obv proxy series (20-day window, based on daily close direction)
+      - today's candle metrics for the volume rule
+    """
+    data = normalize_ohlcv_columns(raw_data)
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+
+    daily = data.resample("1D").agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+    ).dropna()
+
+    if len(daily) < 30:
+        return None
+
+    # OBV divergence proxy (20-day): OBV-like cumulative sum driven by daily close direction.
+    obv_window = daily.tail(20).copy()
+    close_diff = obv_window["Close"].diff().fillna(0.0)
+    direction = close_diff.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    obv_proxy = (direction * obv_window["Volume"]).cumsum()
+
+    # Volume Profile (POC) proxy (30-day): bin the daily closes and assign daily volume to bins.
+    vp = daily.tail(30).copy()
+    n_bins = 20
+    bin_codes, bin_edges = pd.cut(
+        vp["Close"], bins=n_bins, labels=False, retbins=True, include_lowest=True
+    )
+    vp["bin"] = bin_codes
+    volume_by_bin = vp.groupby("bin")["Volume"].sum()
+    if volume_by_bin.empty:
+        return None
+    poc_bin = int(volume_by_bin.idxmax())
+    poc_price = float((bin_edges[poc_bin] + bin_edges[poc_bin + 1]) / 2.0)
+
+    # VWAP (30-day) proxy: typical-price weighted by daily volume
+    typical_price = (vp["High"] + vp["Low"] + vp["Close"]) / 3.0
+    vol_sum = float(vp["Volume"].sum())
+    vwap_30 = float((typical_price * vp["Volume"]).sum() / vol_sum) if vol_sum > 0 else None
+
+    avg20_vol = float(daily["Volume"].tail(20).mean())
+    today = daily.iloc[-1]
+    is_green = float(today["Close"]) > float(today["Open"])
+    vol_ratio = float(today["Volume"]) / avg20_vol if avg20_vol > 0 else None
+
+    return {
+        "daily": daily,
+        "obv_window": obv_window,
+        "obv_proxy": obv_proxy,
+        "poc_price": poc_price,
+        "vwap_30": vwap_30,
+        "avg20_vol": avg20_vol,
+        "today": today,
+        "is_green": is_green,
+        "vol_ratio": vol_ratio,
+    }
+
+
+def plot_reversal_diagnostics(raw_1h: pd.DataFrame, indicator_4h: pd.DataFrame, stock: str, reversal_conf: dict):
+    diag = compute_reversal_diagnostics(raw_1h, stock)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), gridspec_kw={"height_ratios": [2.2, 1.3, 1.6]})
+
+    if not diag or diag.get("vwap_30") is None:
+        axes[0].text(0.5, 0.5, "Not enough data to plot reversal diagnostics.", ha="center")
+        for ax in axes[1:]:
+            ax.axis("off")
+        return fig
+
+    # Price panel (4h): Close + BB + VWAP and POC levels (horizontal lines).
+    ax_price = axes[0]
+    ax_price.plot(indicator_4h.index, indicator_4h["Close"], label="Close (4h)", color="blue", linewidth=1.0)
+    ax_price.plot(indicator_4h.index, indicator_4h.get("BB_High"), label="BB High (2σ)", color="red", linestyle="--", linewidth=0.9)
+    ax_price.plot(indicator_4h.index, indicator_4h.get("BB_Low"), label="BB Low (2σ)", color="green", linestyle="--", linewidth=0.9)
+    ax_price.axhline(diag["vwap_30"], label="VWAP (30D)", color="purple", linestyle="-", linewidth=1.0)
+    ax_price.axhline(diag["poc_price"], label="POC (30D)", color="orange", linestyle="--", linewidth=1.1)
+
+    ax_price.set_title(f"Reversal diagnostics – {stock} | Score {reversal_conf['total']}/100")
+    ax_price.legend(loc="upper left", fontsize=8)
+    ax_price.grid(True, alpha=0.25)
+
+    # OBV panel (daily, 20-day proxy): OBV-like proxy + scaled Close (so you can see divergence).
+    ax_obv = axes[1]
+    obv_proxy = diag["obv_proxy"]
+    ax_obv.plot(obv_proxy.index, obv_proxy.values, label="OBV proxy (20D)", color="#1f77b4")
+    close = diag["obv_window"]["Close"]
+    if close.max() != close.min():
+        scaled_close = (close - close.min()) / (close.max() - close.min())
+        scaled_obv = (obv_proxy - obv_proxy.min())
+        if scaled_obv.max() != 0:
+            scaled_close = scaled_close * scaled_obv.max() + obv_proxy.min()
+        ax_obv.plot(close.index, scaled_close.values, label="Close (scaled)", color="#7f7f7f", linewidth=1.0)
+    ax_obv.set_ylabel("OBV proxy")
+    ax_obv.legend(loc="upper left", fontsize=8)
+    ax_obv.grid(True, alpha=0.25)
+
+    # Volume panel (daily, 30-day window): daily volume bars + 20D avg line.
+    ax_vol = axes[2]
+    daily = diag["daily"]
+    avg20 = diag["avg20_vol"]
+    vp_window = daily.tail(30).copy()
+    vol_colors = []
+    for _, r in vp_window.iterrows():
+        green = float(r["Close"]) > float(r["Open"])
+        vol_pass = avg20 > 0 and float(r["Volume"]) >= 1.2 * avg20
+        vol_colors.append("#2ca02c" if (green and vol_pass) else "#c7c7c7")
+    ax_vol.bar(vp_window.index, vp_window["Volume"].values, color=vol_colors, width=0.8)
+    ax_vol.axhline(avg20, color="blue", linestyle="--", linewidth=1.0, label="20D avg vol")
+    ax_vol.set_ylabel("Volume")
+    ax_vol.legend(loc="upper left", fontsize=8)
+    ax_vol.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    return fig
+
+
 def main():
     st.set_page_config(page_title="Stock Technical Dashboard", layout="wide")
     # Reduce vertical spacing; compact tables
@@ -758,14 +884,46 @@ def main():
         r1, r2 = st.columns([1, 2])
         r1.metric("Reversal confidence", f"{reversal_conf['total']}/100")
         r2.metric("Confidence label", reversal_conf["label"])
-        score_fig = plot_reversal_scorecard(
-            reversal_conf["scores"], reversal_conf["total"], reversal_conf["label"]
-        )
-        st.pyplot(score_fig)
         comp_df = pd.DataFrame(
             [{"Criterion": k, "Score": v} for k, v in reversal_conf["scores"].items()]
         )
         st.dataframe(comp_df, use_container_width=True, hide_index=True, height=182)
+        with st.expander("Rule values used (for debugging / transparency)", expanded=False):
+            diag = compute_reversal_diagnostics(raw_data, active_stock)
+            if not diag:
+                st.info("Not enough data to compute rule values yet.")
+            else:
+                latest_close = float(diag["today"]["Close"])
+                st.write(
+                    {
+                        "Latest close": f"${latest_close:.2f}",
+                        "VWAP (30D)": f"${diag['vwap_30']:.2f}" if diag.get("vwap_30") is not None else "—",
+                        "POC (30D proxy)": f"${diag['poc_price']:.2f}" if diag.get("poc_price") is not None else "—",
+                        "Volume (today)": f"{diag['today']['Volume']:.0f}",
+                        "Avg volume (20D)": f"{diag['avg20_vol']:.0f}",
+                        "Volume ratio": f"{diag['vol_ratio']:.2f}x" if diag.get("vol_ratio") is not None else "—",
+                        "Latest candle green?": bool(diag["is_green"]),
+                    }
+                )
+                # OBV divergence diagnostics
+                obv_proxy = diag["obv_proxy"]
+                obv_trend = float(obv_proxy.iloc[-1] - obv_proxy.iloc[0])
+                price_trend = float(diag["obv_window"]["Close"].iloc[-1] - diag["obv_window"]["Close"].iloc[0])
+                st.write(
+                    {
+                        "OBV proxy trend (20D)": f"{obv_trend:.2f}",
+                        "Price change (20D)": f"{price_trend:.2f}",
+                    }
+                )
+        st.caption("Reversal confidence visualization (VWAP, POC, OBV proxy, volume strength).")
+        diag_fig = plot_reversal_diagnostics(raw_data, indicator_data, active_stock, reversal_conf)
+        st.pyplot(diag_fig, use_container_width=True)
+
+        with st.expander("Score breakdown chart (0 or 25 per rule)", expanded=False):
+            score_fig = plot_reversal_scorecard(
+                reversal_conf["scores"], reversal_conf["total"], reversal_conf["label"]
+            )
+            st.pyplot(score_fig, use_container_width=True)
         fig = plot_technicals(active_stock, indicator_data)
         st.pyplot(fig)
         with st.expander("Last 30 periods (4h)", expanded=False):
@@ -1050,17 +1208,37 @@ Uses **4-hour bars** over the selected number of years (Yahoo 1h data, up to 2 y
 
         with st.expander("Reversal confidence score (0-100)"):
             st.markdown("""
-This score adds four checks (25 points each):
+This score adds four checks (25 points each), for a total out of 100:
 
-- **OBV Divergence (+25):** OBV trends up while price is flat/down (bullish divergence).
-- **Volume Profile POC (+25):** Current price is above the 30-day Point of Control.
-- **Volume Bars (+25):** Latest daily candle is green and volume is greater than 1.2x the 20-day average.
-- **VWAP (+25):** Current price is above the 30-day VWAP.
+1. **OBV Divergence (+25):**  
+   - **Meaning:** bullish divergence where volume flow improves even though price isn’t.  
+   - **How it’s computed here (proxy):** on a **20-day** daily window, we build an OBV-like cumulative series using daily volume and the **direction of daily close changes** (up adds volume, down subtracts volume, unchanged adds 0).  
+   - **Scored +25 when:** the OBV proxy trend is **up** while the **20-day close change** is **flat or down**.  
+   - Otherwise: **0**.
+
+2. **Volume Profile POC (+25):**  
+   - **Meaning:** the price bin with the most trading volume (highest activity area).  
+   - **How it’s computed here (approximation):** use the last **30 days** of daily data, bin daily closes into **20 price bins**, sum daily volume per bin, and take the bin with the highest summed volume as the **POC**.  
+   - **Scored +25 when:** latest close **> POC price**.
+
+3. **Volume Bars (+25):**  
+   - **Meaning:** strong participation on the latest daily bar.  
+   - **How it’s computed:**  
+     - latest daily candle must be **green** (Close > Open)  
+     - latest daily volume must be **> 1.2x** the **20-day average** volume  
+   - Otherwise: **0**.
+
+4. **VWAP (+25):**  
+   - **Meaning:** volume-weighted average price over the window.  
+   - **How it’s computed here:** VWAP over the last **30 days** using daily typical price = (High+Low+Close)/3 weighted by daily volume.  
+   - **Scored +25 when:** latest close **> VWAP**.
 
 **Interpretation**
 - **> 75:** Strong Reversal Signal
 - **< 40:** Likely Dead Cat Bounce
 - Otherwise: Neutral / Mixed
+
+Note: OBV + Volume Profile are computed as **daily resample proxies** (since the app’s indicator pipeline is based on 1h -> 4h for technicals).
 """)
 
         with st.expander("Analyst view – Third-party consensus"):
