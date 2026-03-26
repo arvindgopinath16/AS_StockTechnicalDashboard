@@ -122,6 +122,88 @@ def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
     return data_4h.dropna()
 
 
+def calculate_reversal_confidence(raw_data: pd.DataFrame, stock: str) -> dict:
+    """
+    Confidence score for potential reversal (0-100), based on:
+    OBV divergence, 30-day POC, volume bar strength, and VWAP.
+    """
+    data = raw_data.copy()
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(1)
+
+    expected_cols = ["Open", "High", "Low", "Close", "Volume"]
+    if all(col == stock for col in data.columns):
+        if len(data.columns) == 6:
+            data = data.iloc[:, :-1]
+        if len(data.columns) == 5:
+            data.columns = expected_cols
+
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+    daily = data.resample("1D").agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+    ).dropna()
+
+    scores = {"OBV Divergence": 0, "Volume Profile (POC)": 0, "Volume Bars": 0, "VWAP": 0}
+
+    if len(daily) < 30:
+        total = 0
+        label = "Likely Dead Cat Bounce" if total < 40 else "Neutral"
+        return {"total": total, "label": label, "scores": scores}
+
+    # 1) OBV Divergence (bullish): OBV trending up while price flat/down
+    obv_window = daily.tail(20).copy()
+    close_diff = obv_window["Close"].diff().fillna(0.0)
+    direction = close_diff.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    obv = (direction * obv_window["Volume"]).cumsum()
+    price_trend = float(obv_window["Close"].iloc[-1] - obv_window["Close"].iloc[0])
+    obv_trend = float(obv.iloc[-1] - obv.iloc[0])
+    if obv_trend > 0 and price_trend <= 0:
+        scores["OBV Divergence"] = 25
+
+    # 2) Volume Profile POC (30-day): score if current close > POC
+    vp = daily.tail(30).copy()
+    n_bins = 20
+    bin_codes, bin_edges = pd.cut(vp["Close"], bins=n_bins, labels=False, retbins=True, include_lowest=True)
+    vp["bin"] = bin_codes
+    volume_by_bin = vp.groupby("bin")["Volume"].sum()
+    if not volume_by_bin.empty:
+        poc_bin = int(volume_by_bin.idxmax())
+        poc_price = float((bin_edges[poc_bin] + bin_edges[poc_bin + 1]) / 2.0)
+        if float(vp["Close"].iloc[-1]) > poc_price:
+            scores["Volume Profile (POC)"] = 25
+
+    # 3) Volume bars: today's green candle volume > 1.2x 20-day avg
+    avg20_vol = float(daily["Volume"].tail(20).mean())
+    today = daily.iloc[-1]
+    is_green = float(today["Close"]) > float(today["Open"])
+    if avg20_vol > 0 and is_green and float(today["Volume"]) > 1.2 * avg20_vol:
+        scores["Volume Bars"] = 25
+
+    # 4) VWAP: score if current price > 30-day VWAP
+    typical_price = (vp["High"] + vp["Low"] + vp["Close"]) / 3.0
+    vol_sum = float(vp["Volume"].sum())
+    if vol_sum > 0:
+        vwap_30 = float((typical_price * vp["Volume"]).sum() / vol_sum)
+        if float(vp["Close"].iloc[-1]) > vwap_30:
+            scores["VWAP"] = 25
+
+    total = int(sum(scores.values()))
+    if total > 75:
+        label = "Strong Reversal Signal"
+    elif total < 40:
+        label = "Likely Dead Cat Bounce"
+    else:
+        label = "Neutral / Mixed"
+
+    return {"total": total, "label": label, "scores": scores}
+
+
 def run_paper_simulation(
     df_4h: pd.DataFrame,
     money_invested: float,
@@ -617,6 +699,7 @@ def main():
     below_bb_low = latest["Close"] < latest["BB_Low"]
     rsi_extreme = latest["RSI"] < 30
     macd_crossover = latest["MACD"] > latest["MACD_Signal"]
+    reversal_conf = calculate_reversal_confidence(raw_data, active_stock)
 
     # Fetch financial metrics once for both Financial metrics and Valuation tabs
     fin = fetch_financial_metrics(active_stock)
@@ -642,6 +725,13 @@ def main():
         c1.metric("Below BB Low", "Yes" if below_bb_low else "No")
         c2.metric("RSI < 30", "Yes" if rsi_extreme else "No")
         c3.metric("MACD > Signal", "Yes" if macd_crossover else "No")
+        r1, r2 = st.columns([1, 2])
+        r1.metric("Reversal confidence", f"{reversal_conf['total']}/100")
+        r2.metric("Confidence label", reversal_conf["label"])
+        comp_df = pd.DataFrame(
+            [{"Criterion": k, "Score": v} for k, v in reversal_conf["scores"].items()]
+        )
+        st.dataframe(comp_df, use_container_width=True, hide_index=True, height=182)
         fig = plot_technicals(active_stock, indicator_data)
         st.pyplot(fig)
         with st.expander("Last 30 periods (4h)", expanded=False):
@@ -922,6 +1012,21 @@ Uses **4-hour bars** over the selected number of years (Yahoo 1h data, up to 2 y
 - **Realized gain:** Sum of (sale proceeds − cost basis of shares sold) on all sell events.  
 - **Unrealized gain:** Current value of remaining shares minus their cost basis.  
 - **Rate of return:** (Final wealth − Total invested) ÷ Total invested × 100%, where final wealth = cash from sales + current position value.
+""")
+
+        with st.expander("Reversal confidence score (0-100)"):
+            st.markdown("""
+This score adds four checks (25 points each):
+
+- **OBV Divergence (+25):** OBV trends up while price is flat/down (bullish divergence).
+- **Volume Profile POC (+25):** Current price is above the 30-day Point of Control.
+- **Volume Bars (+25):** Latest daily candle is green and volume is greater than 1.2x the 20-day average.
+- **VWAP (+25):** Current price is above the 30-day VWAP.
+
+**Interpretation**
+- **> 75:** Strong Reversal Signal
+- **< 40:** Likely Dead Cat Bounce
+- Otherwise: Neutral / Mixed
 """)
 
         with st.expander("Analyst view – Third-party consensus"):
