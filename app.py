@@ -1460,9 +1460,14 @@ def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict) -> dict:
 
     growth = [x for x in (q.get("rev_cagr"), q.get("eps_cagr"), q.get("fcf_cagr")) if x is not None]
     if growth:
-        g = min(10.0, max(3.0, float(pd.Series(growth).median())))
-        g = round(g * 2) / 2.0
-        notes.append(f"g {g:g}% = median of historical revenue / EPS / FCF growth (kept within 3-10%)")
+        raw_g = float(pd.Series(growth).median())
+        g = round(min(10.0, max(3.0, raw_g)) * 2) / 2.0
+        if raw_g > 10.0:
+            notes.append(f"g {g:g}% (historical median growth {raw_g:.1f}%, capped at 10% because a 10-year projection should not assume a hot streak lasts)")
+        elif raw_g < 3.0:
+            notes.append(f"g {g:g}% (historical median growth {raw_g:.1f}%, raised to the 3% floor)")
+        else:
+            notes.append(f"g {g:g}% = median of historical revenue / EPS / FCF growth ({raw_g:.1f}%)")
     else:
         g = 7.0
         notes.append("g 7% (generic; no growth history)")
@@ -1477,7 +1482,12 @@ def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict) -> dict:
     pe_med = v.get("pe_median")
     if pe_med is not None:
         k = float(round(min(22.0, max(12.0, pe_med))))
-        notes.append(f"K {k:g} = own median P/E (kept within 12-22)")
+        if pe_med > 22.0:
+            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, capped at 22)")
+        elif pe_med < 12.0:
+            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, raised to the 12 floor)")
+        else:
+            notes.append(f"K {k:g} = own median P/E ({pe_med:.1f})")
     else:
         k = 18.0
         notes.append("K 18 (generic; no P/E history)")
@@ -2098,6 +2108,211 @@ def render_portfolio_tab(r_default: float):
     )
 
 
+_CMP_GREEN = "background-color: #d4edda; color: #155724"
+
+# (section, label, key, format, direction: +1 higher is better / -1 lower is better / 0 no highlight, positive_only)
+_CMP_ROWS = [
+    ("Overview", "Name", "name", None, 0, False),
+    ("Overview", "Sector / type", "sector", None, 0, False),
+    ("Overview", "Price", "price", "{:,.2f}", 0, False),
+    ("Overview", "Market cap", "mcap", "mcap", 0, False),
+    ("Overview", "Verdict", "verdict_short", None, 0, False),
+    ("Scores", "Quality score %", "quality_pct", "{:.0f}", 1, False),
+    ("Scores", "Valuation score %", "valuation_pct", "{:.0f}", 1, False),
+    ("Scores", "Timing score %", "timing_pct", "{:.0f}", 1, False),
+    ("Scores", "Buy score (0-100)", "buy_score", "{:.0f}", 1, False),
+    ("Valuation", "P/E (latest year)", "pe1", "{:.1f}", -1, True),
+    ("Valuation", "P/E (3Y average earnings)", "pe3", "{:.1f}", -1, True),
+    ("Valuation", "Forward P/E", "fwd_pe", "{:.1f}", -1, True),
+    ("Valuation", "PEG", "peg", "{:.2f}", -1, True),
+    ("Valuation", "EV / EBITDA", "ev_ebitda", "{:.1f}", -1, True),
+    ("Valuation", "FCF yield %", "fcf_yield", "{:.1f}", 1, False),
+    ("Valuation", "P/E percentile vs own history", "pe_pct", "{:.0f}", -1, False),
+    ("Valuation", "Upside to fair value %", "upside_pct", "{:+.0f}", 1, False),
+    ("Valuation", "Buy price: EPS model (10Y)", "buy_eps10", "{:,.2f}", 0, False),
+    ("Valuation", "Buy price: DCF (10Y)", "buy_dcf", "{:,.2f}", 0, False),
+    ("Valuation", "Assumed growth g %", "g_pct", "{:.1f}", 0, False),
+    ("Valuation", "Assumed terminal multiple K", "k", "{:.0f}", 0, False),
+    ("Quality", "ROIC %", "roic", "{:.1f}", 1, False),
+    ("Quality", "Operating margin change (pts)", "opm_chg", "{:+.1f}", 1, False),
+    ("Quality", "Revenue CAGR %", "rev_cagr", "{:.1f}", 1, False),
+    ("Quality", "EPS CAGR %", "eps_cagr", "{:.1f}", 1, False),
+    ("Quality", "FCF CAGR %", "fcf_cagr", "{:.1f}", 1, False),
+    ("Quality", "Net debt / EBITDA (x)", "nd_ebitda", "{:.1f}", -1, False),
+    ("Quality", "Interest coverage (x)", "int_cov", "{:.1f}", 1, False),
+    ("Quality", "Stock compensation % of FCF", "sbc", "{:.1f}", -1, False),
+    ("Quality", "Dividend (forward, per share)", "div", "{:.2f}", 0, False),
+    ("Timing", "Price vs 200-day average %", "vs200", "{:+.1f}", 0, False),
+    ("Timing", "Below 52-week high %", "dd52", "{:.1f}", 0, False),
+    ("Timing", "Weekly RSI", "wrsi", "{:.0f}", 0, False),
+    ("Timing", "6-month return vs SPY (pts)", "rel6", "{:+.1f}", 1, False),
+    ("Timing", "1-year return %", "ret1y", "{:+.1f}", 1, False),
+    ("Timing", "Overbought signals (of 3)", "sell_signals", "{:.0f}", -1, False),
+    ("Timing", "Profit-taking signal", "trim_level", None, 0, False),
+]
+
+
+def _fmt_big(x) -> str:
+    try:
+        if x is None or pd.isna(x):
+            return "-"
+        ax = abs(float(x))
+        if ax >= 1e12:
+            return f"{x / 1e12:.2f}T"
+        if ax >= 1e9:
+            return f"{x / 1e9:.1f}B"
+        return f"{x / 1e6:.0f}M"
+    except Exception:
+        return "-"
+
+
+def _cmp_values(row: dict, fin: dict, q: dict, v: dict, tr: dict) -> dict:
+    """Flat metric dict for the Compare table."""
+    nd, eb = q.get("net_debt"), q.get("ebitda")
+    nd_ebitda = (nd / eb) if (nd is not None and eb is not None and eb > 0) else None
+    mcap, fcf1 = fin.get("Market Cap"), fin.get("FCF (1Y)")
+    fcf_yield = (fcf1 / mcap * 100.0) if (mcap and fcf1 is not None and mcap > 0 and not is_financial(fin)) else None
+    out = dict(row)
+    out.update(
+        {
+            "sector": row.get("sector") or row.get("type") or "",
+            "name": (row.get("name") or "")[:26],
+            "mcap": mcap, "pe1": fin.get("P/E (1Y)"), "pe3": fin.get("P/E (3Y Avg)"), "fwd_pe": v.get("forward_pe"),
+            "peg": v.get("peg"), "ev_ebitda": v.get("ev_ebitda"), "fcf_yield": fcf_yield, "pe_pct": v.get("pe_percentile"),
+            "roic": q.get("roic"), "opm_chg": q.get("op_margin_change"), "rev_cagr": q.get("rev_cagr"),
+            "eps_cagr": q.get("eps_cagr"), "fcf_cagr": q.get("fcf_cagr"), "nd_ebitda": nd_ebitda,
+            "int_cov": q.get("interest_coverage"), "sbc": q.get("sbc_pct_fcf"), "div": fin.get("Div Rate (FWD)"),
+            "vs200": tr.get("pct_vs_ma200"), "dd52": None if tr.get("dd_52w") is None else -tr["dd_52w"],
+            "wrsi": tr.get("weekly_rsi"), "rel6": tr.get("rel_6m"), "ret1y": tr.get("ret_1y"),
+        }
+    )
+    return out
+
+
+def render_compare_tab(active_stock: str, favorites: list, r_default: float):
+    st.subheader("Compare stocks side by side")
+    st.caption(
+        "Pick 2 to 4 stocks. Green marks the best value in a row (only where higher or lower is clearly better). "
+        "Each stock uses its own suggested valuation defaults, so Valuation scores compare each price against that stock's own assumptions."
+    )
+    options = list(dict.fromkeys([active_stock] + list(favorites)))
+    picked = st.multiselect("Choose stocks to compare (your current stock and Favorites)", options, default=[active_stock], max_selections=4)
+    extra_txt = st.text_input("Add other tickers (comma separated)", value="", key="cmp_extra")
+    extras = [s.strip().upper() for s in extra_txt.split(",") if s.strip()]
+    symbols = list(dict.fromkeys(picked + extras))
+    if len(symbols) > 4:
+        st.caption("Comparing the first 4 only.")
+        symbols = symbols[:4]
+    if len(symbols) < 2:
+        st.info("Choose at least two stocks (or type another ticker above) to compare.")
+        return
+
+    snaps: dict = {}
+    failed: list = []
+    bar = st.progress(0.0, text="Loading...")
+    bench = download_daily("SPY")
+    for i, sym in enumerate(symbols, start=1):
+        bar.progress(i / len(symbols), text=f"Loading {sym} ({i}/{len(symbols)}) - the first load takes several seconds per stock")
+        try:
+            row = score_symbol_cached(sym, r_default)
+            if row.get("price") is None:
+                failed.append(f"{sym} ({row.get('error') or 'no data'})")
+                continue
+            etf = row["type"] in ETF_TYPES
+            fin = {} if etf else (fetch_financial_metrics(sym) or {})
+            q = {} if etf else (fetch_quality_metrics(sym) or {})
+            v = {} if etf else (fetch_valuation_context(sym) or {})
+            daily = download_daily(sym)
+            tr = compute_trend_context(daily, bench)
+            snaps[sym] = (row, _cmp_values(row, fin, q, v, tr), daily)
+        except Exception as exc:
+            failed.append(f"{sym} ({str(exc)[:60]})")
+    bar.empty()
+    if failed:
+        st.warning("Could not load: " + ", ".join(failed))
+    if len(snaps) < 2:
+        st.info("Need at least two stocks with data to compare.")
+        return
+    cols = list(snaps)
+
+    # ---- quick takeaways ----
+    def _best(key: str, high: bool = True):
+        cand = {s: snaps[s][0].get(key) for s in cols}
+        cand = {s: x for s, x in cand.items() if x is not None and not pd.isna(x)}
+        if len(cand) < 2:
+            return None
+        target = max(cand.values()) if high else min(cand.values())
+        return [s for s, x in cand.items() if x == target], target
+
+    notes = []
+    for label, key, high, fmt in (
+        ("Highest buy score", "buy_score", True, "{:.0f}"),
+        ("Highest quality score", "quality_pct", True, "{:.0f}%"),
+        ("Cheapest versus fair value", "upside_pct", True, "{:+.0f}% upside"),
+        ("Most overbought", "sell_signals", True, "{:.0f} of 3 signals"),
+    ):
+        b = _best(key, high)
+        if b and not (key == "sell_signals" and b[1] < 2):
+            if key == "upside_pct":
+                detail = f"{b[1]:.0f}% upside" if b[1] >= 0 else f"still {abs(b[1]):.0f}% above fair value"
+                label = "Most upside to fair value" if b[1] >= 0 else "Closest to fair value"
+            else:
+                detail = fmt.format(b[1])
+            notes.append(f"- **{label}:** {', '.join(b[0])} ({detail})")
+    if notes:
+        st.markdown("\n".join(notes))
+
+    # ---- table ----
+    recs, colors = [], []
+    for section, label, key, fmt, direction, pos_only in _CMP_ROWS:
+        rec, col, nums = {"Section": section, "Metric": label}, {"Section": "", "Metric": ""}, {}
+        for s in cols:
+            x = snaps[s][1].get(key)
+            if fmt is None:
+                rec[s] = "-" if (x is None or x == "" or (isinstance(x, float) and pd.isna(x))) else str(x)
+            elif fmt == "mcap":
+                rec[s] = _fmt_big(x)
+            else:
+                rec[s] = _f(x, fmt)
+            col[s] = ""
+            if direction and isinstance(x, (int, float)) and not pd.isna(x) and (not pos_only or x > 0):
+                nums[s] = float(x)
+        if direction and len(nums) >= 2:
+            target = max(nums.values()) if direction > 0 else min(nums.values())
+            winners = [s for s, x in nums.items() if x == target]
+            if len(winners) < len(nums):
+                for w in winners:
+                    col[w] = _CMP_GREEN
+        recs.append(rec)
+        colors.append(col)
+    tbl = pd.DataFrame(recs)
+    color_df = pd.DataFrame(colors, columns=tbl.columns)
+    st.dataframe(tbl.style.apply(lambda _: color_df, axis=None), hide_index=True, use_container_width=True, height=36 * (len(tbl) + 1) + 3)
+
+    # ---- charts ----
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        st.markdown("**Pillar scores (%)**")
+        bars = pd.DataFrame(
+            {s: [snaps[s][0].get("quality_pct"), snaps[s][0].get("valuation_pct"), snaps[s][0].get("timing_pct")] for s in cols},
+            index=["Quality", "Valuation", "Timing"],
+        ).astype(float).fillna(0.0)
+        st.bar_chart(bars)
+    with ch2:
+        st.markdown("**Price, last 12 months (start = 100)**")
+        series = {}
+        for s in cols:
+            try:
+                c = normalize_ohlcv_columns(snaps[s][2])["Close"].astype(float).dropna().tail(252)
+                c.index = pd.to_datetime(c.index).tz_localize(None)
+                series[s] = c / c.iloc[0] * 100.0
+            except Exception:
+                continue
+        if series:
+            st.line_chart(pd.DataFrame(series))
+    st.caption("Screening aid only, not investment advice. Green does not mean buy: read the Long-term checklist for each stock.")
+
+
 def plot_long_term_trend(stock: str, trend: dict):
     s = trend["series"]
     fig, axes = plt.subplots(3, 1, figsize=(7, 5.2), sharex=True, gridspec_kw={"height_ratios": [2.4, 1, 1]})
@@ -2410,10 +2625,11 @@ def main():
         st.session_state["val_r_pct"] = float(r_default)
     st.session_state["val_defaults_for"] = active_stock
 
-    tab_charts, tab_lt, tab_rank, tab_port, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_cmp, tab_rank, tab_port, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
         [
             "Charts",
             "Long-term checklist",
+            "Compare",
             "Rankings",
             "Portfolio",
             "Financial metrics",
@@ -2562,6 +2778,9 @@ def main():
                     }
                 )
                 st.caption("Yahoo provides about 4 fiscal years, so growth rates cover roughly 3 years.")
+
+    with tab_cmp:
+        render_compare_tab(active_stock, st.session_state["favorites"], r_default)
 
     with tab_rank:
         render_rankings_tab(st.session_state["favorites"], r_default)
@@ -2927,6 +3146,7 @@ def main():
 |---|---|---|
 | **Charts** | Is the price stretched or turning right now? | Timing an entry over the next days to weeks |
 | **Long-term checklist** | Is this a good business, at a good price, at a sensible moment? | First screen for any stock; the main decision tab |
+| **Compare** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
 | **Rankings** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your Favorites and the wider stock list |
 | **Portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
 | **Financial metrics** | How healthy are the company's profit, growth, cash and debt? | Checking the business behind the ticker |
@@ -3067,7 +3287,7 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **Return r (%):** the yearly return you demand; the rate used to bring future values back to today. Default: S&P 500 trailing 3-year annualized return plus 2%, capped at 15%, so the hurdle does not balloon after a strong market.
 - **MoS (%):** margin of safety, a cushion for being wrong. A 25% margin means you only buy at 75% of fair value.
 
-Defaults are suggested per stock: g is the median of its past revenue, EPS and FCF growth (kept between 3% and 10%); K is its own median P/E (between 12 and 22, capped at 15 for leveraged or cash-burning companies); MoS is 25% (15% for high-quality businesses, 35% for leveraged or negative-FCF ones). Edit any input; **Reset inputs to suggested** restores them. The caption under the inputs also shows the stock's historical growth to keep g realistic.
+Defaults are suggested per stock: g is the median of its past revenue, EPS and FCF growth (kept between 3% and 10%; the line under the inputs shows the raw historical number and says when it was capped). The cap exists because the model compounds g for 10 years, and a fast recent streak (for example 12% or 30%) rarely lasts a decade, so using it would make a stock look cheaper than it is. If you believe a company can keep growing faster, type a higher g yourself; K is its own median P/E (between 12 and 22, capped at 15 for leveraged or cash-burning companies); MoS is 25% (15% for high-quality businesses, 35% for leveraged or negative-FCF ones). Edit any input; **Reset inputs to suggested** restores them. The caption under the inputs also shows the stock's historical growth to keep g realistic.
 
 **EPS-based model (1, 5 and 10 years)**
 - **M0 (EPS):** last fiscal year earnings per share, the starting point.
@@ -3140,6 +3360,21 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 - Yahoo's label can disagree with the verdict. A stock most analysts rate Buy can still score Neutral because its price is already near the average target or ratings are slipping. That disagreement is useful information.
 - Analyst ratings skew positive (few Sells), so Hold is closer to a soft negative. The trend and the estimate revisions matter more than the label.
 - Targets and ratings lag the market, and small companies may have few or no analysts.
+""")
+
+        with st.expander("Compare tab: put 2-4 stocks side by side"):
+            st.markdown("""
+**What it helps you do:** choose between similar stocks, or check a candidate against something you already own, by lining up the same numbers for each.
+
+**How to use it:** pick stocks from the list (your current stock and your Favorites) and/or type other tickers separated by commas. You need at least 2 and at most 4. The first load takes several seconds per stock; repeat loads are fast.
+
+**What you see**
+- **Takeaways:** which stock has the highest buy score, the highest quality, the most upside to fair value, and (if two or more signals are on) which is the most overbought.
+- **Table:** Overview, Scores, Valuation, Quality and Timing rows, using the same definitions as the other tabs. **Green** marks the best value in a row, but only for rows where higher or lower is clearly better (for example higher ROIC, lower P/E, lower debt). Rows such as price, assumed growth, price versus the 200-day average and weekly RSI are shown without highlighting. Negative or zero P/E values are ignored when picking the best.
+- **Pillar scores chart:** Quality, Valuation and Timing percentages for each stock.
+- **Price chart:** the last 12 months with every stock starting at 100, so you can compare performance fairly.
+
+**Read it with care:** each stock's valuation uses its own suggested growth, multiple and margin of safety, so Valuation scores show how each price compares with that stock's own assumptions, not with a common yardstick. Compare ETFs only on Timing. Green means better on that row, not buy.
 """)
 
         with st.expander("Rankings tab: top 10 buy and top 10 avoid"):
