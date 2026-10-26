@@ -1,1 +1,64 @@
+name: Daily stock scan
 
+on:
+  schedule:
+    # 21:30 UTC on weekdays = after the US market close (4:30-5:30 pm Eastern)
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "TEST ONLY: scan just the first N symbols (leave blank for the full scan)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          LIMIT: ${{ github.event.inputs.limit }}
+        run: |
+          if [ -n "$LIMIT" ]; then
+            python scan_universe.py --limit "$LIMIT"
+          else
+            python scan_universe.py
+          fi
+
+      - name: Save results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rankings.csv scan_state.json
+          if git diff --staged --quiet; then
+            echo "No changes to save."
+          else
+            git commit -m "Daily scan $(date -u +%F)"
+            git push
+          fi
+
+      - name: Send alert (GitHub issue, emailed to the repo owner)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f alert.md ]; then
+            gh issue create --title "$(cat alert_title.txt)" --body-file alert.md --assignee "${{ github.repository_owner }}" \
+              || gh issue create --title "$(cat alert_title.txt)" --body-file alert.md
+          else
+            echo "No alert today."
+          fi
