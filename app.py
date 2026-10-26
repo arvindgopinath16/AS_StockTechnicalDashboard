@@ -1,3 +1,4 @@
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1426,7 +1427,11 @@ def build_long_term_checklist(price: float, fin: dict, quality: dict, valctx: di
             None if tr.get("rel_6m") is None else tr["rel_6m"] > -15,
             _fmt(tr.get("rel_6m"), " pts"),
         ),
-        _chk("4h triggers: >= 2 of BB low / RSI<30 / MACD>Signal", n_trig >= 2, f"{n_trig}/3"),
+        _chk(
+            "4h triggers: >= 2 of BB low / RSI<30 / MACD>Signal",
+            None if all(x is None for x in triggers) else n_trig >= 2,
+            "N/A" if all(x is None for x in triggers) else f"{n_trig}/3",
+        ),
     ]
     # Debt, cash-flow and ROIC based checks are not meaningful for banks / insurers
     if is_financial(fin):
@@ -1516,6 +1521,581 @@ def long_term_verdict(scores: dict):
     if v >= 50 and q < 50:
         return "error", "Cheap, but quality is weak - value-trap / falling-knife risk", "Cheap valuation alone is not a long-term buy point."
     return "warning", "Not a long-term buy point yet", "Quality or valuation criteria are not met."
+
+
+# ---------------------------------------------------------------------------
+# Favorites file, instrument type, profit-taking signals, scoring and rankings
+# (shared by the Streamlit app and by scan_universe.py, the daily scanner)
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+RANKINGS_FILE = "rankings.csv"
+STATE_FILE = "scan_state.json"
+ETF_TYPES = {"ETF", "MUTUALFUND", "INDEX"}
+
+
+def _data_path(name: str):
+    """Find a data file next to app.py (or in the working directory), ignoring upper/lower case."""
+    for folder in (BASE_DIR, Path.cwd()):
+        try:
+            for p in folder.iterdir():
+                if p.is_file() and p.name.lower() == name.lower():
+                    return p
+        except OSError:
+            continue
+    return None
+
+
+def _read_symbols(name: str) -> list:
+    p = _data_path(name)
+    if p is None:
+        return []
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return []
+    col = next((c for c in df.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+    if col is None:
+        return []
+    out: list = []
+    for s in df[col].dropna().astype(str):
+        s = s.strip().upper()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def load_favorites_file() -> list:
+    """Your permanent favorites list (Favorites.csv, column 'Symbol')."""
+    return _read_symbols("Favorites.csv")
+
+
+def load_universe() -> list:
+    """Everything the daily scan scores: Favorites first, then stockList.csv."""
+    out: list = []
+    for s in _read_symbols("Favorites.csv") + _read_symbols("stockList.csv"):
+        if s not in out:
+            out.append(s)
+    return out
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_instrument_info(stock: str) -> dict:
+    """Instrument type (EQUITY / ETF ...), name and sector. Raises when Yahoo returns nothing, so failures are not cached."""
+    info = _retry(lambda: yf.Ticker(stock).info, tries=2) or {}
+    qt = str(info.get("quoteType") or "").upper()
+    if not qt:
+        raise RuntimeError("no instrument info")
+    return {
+        "type": qt,
+        "name": str(info.get("shortName") or info.get("longName") or ""),
+        "sector": info.get("sector"),
+    }
+
+
+def get_instrument_info(stock: str) -> dict:
+    try:
+        return fetch_instrument_info(stock)
+    except Exception:
+        return {"type": "UNKNOWN", "name": "", "sector": None}
+
+
+def compute_sell_signals(daily: pd.DataFrame) -> dict:
+    """Profit-taking signals on daily bars (same rules as StockSeller_v2.py):
+    close above the upper Bollinger Band (15, 2), RSI(10) above 70, MACD (8/21/5) below its signal line."""
+    out = {"count": None, "above_bb": None, "rsi_hot": None, "macd_bearish": None, "rsi": None}
+    if daily is None or daily.empty:
+        return out
+    try:
+        close = normalize_ohlcv_columns(daily)["Close"].astype(float).dropna()
+    except Exception:
+        return out
+    if len(close) < 40:
+        return out
+    bb = BollingerBands(close=close, window=15, window_dev=2)
+    rsi = RSIIndicator(close, window=10).rsi()
+    macd = MACD(close, window_slow=21, window_fast=8, window_sign=5)
+    above = bool(close.iloc[-1] > bb.bollinger_hband().iloc[-1])
+    hot = bool(rsi.iloc[-1] > 70)
+    bear = bool(macd.macd().iloc[-1] < macd.macd_signal().iloc[-1])
+    out.update(
+        {"count": int(above) + int(hot) + int(bear), "above_bb": above, "rsi_hot": hot, "macd_bearish": bear, "rsi": float(rsi.iloc[-1])}
+    )
+    return out
+
+
+def _above_fair(val_rows: list):
+    """True when the price is above fair value in every available valuation model; None when there is no model."""
+    if not val_rows:
+        return None
+    return all(r["Status"] == "Above fair value" for r in val_rows)
+
+
+def trim_signal(sell_count, above_fair, q_pct, q_n) -> tuple:
+    """Profit-taking level: Trim / Review / Watch / Hold, with a short reason."""
+    weak = q_pct is not None and (q_n or 0) >= 4 and q_pct < 50
+    n = sell_count or 0
+    if n >= 3 and above_fair:
+        return "Trim", "3/3 overbought signals and price above fair value"
+    if weak:
+        return "Review", f"Quality score only {q_pct:.0f}% - re-check the thesis"
+    if n >= 2 or (above_fair and n >= 1):
+        return "Watch", f"{n}/3 overbought signals" + (" and price above fair value" if above_fair else "")
+    return "Hold", "No profit-taking signals"
+
+
+def _short_verdict(headline: str) -> str:
+    for start, short in (
+        ("Strong long-term entry", "Strong candidate"),
+        ("Good business at a fair price", "Good, fair price"),
+        ("Quality business, but not cheap", "Quality, not cheap"),
+        ("Cheap, but quality is weak", "Value-trap risk"),
+        ("Not a long-term buy point", "Not yet"),
+        ("Not enough data", "No data"),
+        ("ETF", "ETF (timing only)"),
+    ):
+        if headline.startswith(start):
+            return short
+    return headline
+
+
+def score_symbol(stock: str, r_default: float, bench=None) -> dict:
+    """Run the full long-term checklist for one symbol with its suggested valuation defaults.
+    Returns one flat row (used by the Rankings tab, the Portfolio tab and the daily scan)."""
+    row = {
+        "symbol": stock, "name": "", "type": "UNKNOWN", "sector": "", "price": None, "price_date": "",
+        "verdict": "", "verdict_short": "", "quality_pct": None, "quality_n": 0, "valuation_pct": None,
+        "valuation_n": 0, "timing_pct": None, "timing_n": 0, "eligible": False, "buy_score": None,
+        "avoid_score": None, "sell_signals": None, "rsi_daily": None, "above_fair": None, "upside_pct": None,
+        "fair_eps10": None, "buy_eps10": None, "fair_dcf": None, "buy_dcf": None, "trim_level": "",
+        "trim_reason": "", "g_pct": None, "k": None, "mos_pct": None, "error": "",
+    }
+    try:
+        inst = get_instrument_info(stock)
+        row.update(type=inst["type"], name=inst["name"], sector=inst.get("sector") or "")
+        daily = download_daily(stock)
+        if daily is None or daily.empty:
+            raise ValueError("no price history")
+        if bench is None:
+            bench = download_daily("SPY")
+        trend = compute_trend_context(daily, bench)
+        close = normalize_ohlcv_columns(daily)["Close"].astype(float).dropna()
+        price = float(trend.get("price") or close.iloc[-1])
+        row["price"] = price
+        row["price_date"] = str(pd.to_datetime(close.index[-1]).date())
+
+        sig: dict = {}
+        try:
+            ind = calculate_indicators(download_data(stock), stock)
+            last = ind.iloc[-1]
+            sig = {
+                "below_bb_low": bool(last["Close"] < last["BB_Low"]),
+                "rsi_extreme": bool(last["RSI"] < 30),
+                "macd_crossover": bool(last["MACD"] > last["MACD_Signal"]),
+            }
+        except Exception:
+            sig = {}
+
+        is_etf = row["type"] in ETF_TYPES
+        if is_etf:
+            fin, quality, valctx, val_rows = {}, {}, {}, []
+        else:
+            fin = fetch_financial_metrics(stock) or {}
+            quality = fetch_quality_metrics(stock) or {}
+            valctx = fetch_valuation_context(stock) or {}
+            sugg = suggest_valuation_defaults(fin, quality, valctx)
+            row.update(g_pct=sugg["g"], k=sugg["k"], mos_pct=sugg["mos"])
+            val_rows = summarize_valuation(fin, price, sugg["g"] / 100.0, sugg["k"], r_default / 100.0, sugg["mos"] / 100.0)
+
+        checklist = build_long_term_checklist(price, fin, quality, valctx, trend, val_rows, sig)
+        scores = {k: pillar_score(v) for k, v in checklist.items()}
+        q_pct, _, q_n = scores["quality"]
+        v_pct, _, v_n = scores["valuation"]
+        t_pct, _, t_n = scores["timing"]
+        headline = "ETF - timing only" if is_etf else long_term_verdict(scores)[1]
+        row.update(
+            verdict=headline, verdict_short=_short_verdict(headline), quality_pct=q_pct, quality_n=q_n,
+            valuation_pct=v_pct, valuation_n=v_n, timing_pct=t_pct, timing_n=t_n,
+        )
+
+        sell = compute_sell_signals(daily)
+        above_fair = _above_fair(val_rows)
+        level, why = trim_signal(sell["count"], above_fair, q_pct, q_n)
+        row.update(sell_signals=sell["count"], rsi_daily=sell["rsi"], above_fair=above_fair, trim_level=level, trim_reason=why)
+
+        by_model = {r["Model"]: r for r in val_rows}
+        e10, d10 = by_model.get("EPS model (10Y)"), by_model.get("DCF (10Y)")
+        if e10:
+            row.update(fair_eps10=e10["Fair value"], buy_eps10=e10["Buy price"])
+        if d10:
+            row.update(fair_dcf=d10["Fair value"], buy_dcf=d10["Buy price"])
+        ups = [r["Upside to fair value %"] for r in val_rows if r.get("Upside to fair value %") is not None]
+        row["upside_pct"] = float(sum(ups) / len(ups)) if ups else None
+
+        # Only operating companies with enough scored checks can be ranked
+        row["eligible"] = bool(not is_etf and q_pct is not None and v_pct is not None and q_n >= 4 and v_n >= 3)
+        if row["eligible"]:
+            t_eff = 50.0 if t_pct is None else t_pct
+            row["buy_score"] = 0.45 * q_pct + 0.40 * v_pct + 0.15 * t_eff
+            overbought = 0.0 if sell["count"] is None else sell["count"] / 3.0 * 100.0
+            row["avoid_score"] = 0.5 * (100.0 - v_pct) + 0.3 * (100.0 - q_pct) + 0.2 * overbought
+    except Exception as exc:
+        row["error"] = str(exc)[:120] or exc.__class__.__name__
+    return row
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def score_symbol_cached(stock: str, r_default: float) -> dict:
+    return score_symbol(stock, r_default)
+
+
+_NUM_COLS = (
+    "price", "quality_pct", "quality_n", "valuation_pct", "valuation_n", "timing_pct", "timing_n", "buy_score",
+    "avoid_score", "sell_signals", "rsi_daily", "upside_pct", "fair_eps10", "buy_eps10", "fair_dcf", "buy_dcf",
+    "g_pct", "k", "mos_pct",
+)
+
+
+def clean_results(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in _NUM_COLS:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    if "eligible" in out.columns:
+        out["eligible"] = out["eligible"].map(lambda x: str(x).strip().lower() == "true" if not isinstance(x, bool) else x)
+    for c in ("name", "sector", "verdict", "verdict_short", "trim_level", "trim_reason", "error", "type", "price_date"):
+        if c in out.columns:
+            out[c] = out[c].fillna("").astype(str)
+    return out
+
+
+def rank_results(df: pd.DataFrame, n: int = 10) -> tuple:
+    """Top-n buy candidates and top-n avoid / overvalued names among rankable operating companies.
+    Buy: Quality >= 50%, ordered by 0.45 Quality + 0.40 Valuation + 0.15 Timing.
+    Avoid: Valuation <= 33% or Quality < 50%, ordered by 0.5 (100 - Valuation) + 0.3 (100 - Quality) + 0.2 Overbought."""
+    empty = pd.DataFrame()
+    if df is None or df.empty:
+        return empty, empty
+    d = clean_results(df)
+    ok = d[d["eligible"]]
+    if ok.empty:
+        return empty, empty
+    buy = ok[ok["quality_pct"] >= 50].sort_values(["buy_score", "valuation_pct"], ascending=False).head(n)
+    rest = ok[~ok["symbol"].isin(buy["symbol"])]
+    avoid = rest[(rest["valuation_pct"] <= 33.4) | (rest["quality_pct"] < 50)].sort_values("avoid_score", ascending=False).head(n)
+    return buy, avoid
+
+
+def _f(x, fmt: str = "{:.0f}", suffix: str = "") -> str:
+    try:
+        if x is None or pd.isna(x):
+            return "-"
+        return fmt.format(x) + suffix
+    except Exception:
+        return "-"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_rankings():
+    """(results DataFrame or None, scan state dict) from the files written by scan_universe.py."""
+    df, state = None, {}
+    p = _data_path(RANKINGS_FILE)
+    if p is not None:
+        try:
+            df = clean_results(pd.read_csv(p))
+        except Exception:
+            df = None
+    s = _data_path(STATE_FILE)
+    if s is not None:
+        try:
+            state = json.loads(s.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+    return df, state
+
+
+def _rank_view(df: pd.DataFrame, favs: set, new_syms: set) -> pd.DataFrame:
+    rows = []
+    for i, (_, r) in enumerate(df.iterrows(), start=1):
+        sym = r["symbol"]
+        rows.append(
+            {
+                "#": i,
+                "Symbol": f"{sym} \u2605" if sym in favs else sym,
+                "Name": (r["name"] or "")[:26],
+                "Verdict": r["verdict_short"],
+                "Q / V / T %": f"{_f(r['quality_pct'])} / {_f(r['valuation_pct'])} / {_f(r['timing_pct'])}",
+                "Price": _f(r["price"], "{:.2f}"),
+                "Upside to fair": _f(r["upside_pct"], "{:+.0f}", "%"),
+                "Overbought": "-" if pd.isna(r["sell_signals"]) else f"{int(r['sell_signals'])}/3",
+                "New": "NEW" if sym in new_syms else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_rankings_tab(favorites: list, r_default: float):
+    st.subheader("Rankings: top 10 buy and top 10 avoid")
+    file_df, state = load_rankings()
+    live_df = st.session_state.get("live_rankings")
+    favs = set(favorites)
+
+    df, source = (live_df, "live scan of your favorites (this session)") if live_df is not None else (file_df, "daily scan")
+    if df is None or df.empty:
+        st.info(
+            "No scan results yet. The daily GitHub scan writes rankings.csv, or you can run a live scan of your "
+            "Favorites below (takes several minutes)."
+        )
+    else:
+        asof = state.get("asof", "") if source == "daily scan" else "now"
+        n_ok = int((df["error"] == "").sum())
+        st.caption(
+            f"Source: {source}. As of {asof or 'unknown'}. {n_ok} of {len(df)} symbols scored, "
+            f"{int(df['eligible'].sum())} rankable (operating companies with enough data). \u2605 = in your Favorites."
+        )
+        buy, avoid = rank_results(df)
+        new_buy = set(state.get("new_buy", [])) if source == "daily scan" else set()
+        new_avoid = set(state.get("new_avoid", [])) if source == "daily scan" else set()
+
+        hits_b = [s for s in buy["symbol"] if s in favs] if not buy.empty else []
+        hits_a = [s for s in avoid["symbol"] if s in favs] if not avoid.empty else []
+        if hits_b:
+            st.success("Your favorites in the Top 10 Buy list: " + ", ".join(hits_b))
+        if hits_a:
+            st.warning("Your favorites in the Top 10 Avoid list: " + ", ".join(hits_a))
+        if not hits_b and not hits_a:
+            st.info("None of your favorites are in either top 10 list right now.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Top 10 buy candidates**")
+            if buy.empty:
+                st.info("No rankable candidates.")
+            else:
+                st.dataframe(_rank_view(buy, favs, new_buy), hide_index=True, use_container_width=True)
+        with c2:
+            st.markdown("**Top 10 avoid / overvalued**")
+            if avoid.empty:
+                st.info("No names meet the avoid criteria.")
+            else:
+                st.dataframe(_rank_view(avoid, favs, new_avoid), hide_index=True, use_container_width=True)
+
+        fav_df = df[df["symbol"].isin(favs)].copy()
+        st.markdown("**Profit-taking watch (your favorites)**")
+        order = {"Trim": 0, "Review": 1, "Watch": 2, "Hold": 3}
+        watch = fav_df[fav_df["trim_level"].isin(["Trim", "Review", "Watch"])].copy()
+        if watch.empty:
+            st.info("No favorites are showing profit-taking signals.")
+        else:
+            watch["_o"] = watch["trim_level"].map(order)
+            watch = watch.sort_values(["_o", "sell_signals"], ascending=[True, False])
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        "Symbol": watch["symbol"],
+                        "Signal": watch["trim_level"],
+                        "Why": watch["trim_reason"],
+                        "Price": watch["price"].map(lambda x: _f(x, "{:.2f}")),
+                        "Upside to fair": watch["upside_pct"].map(lambda x: _f(x, "{:+.0f}", "%")),
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        with st.expander("All favorites: scores and signals", expanded=False):
+            if fav_df.empty:
+                st.info("None of your favorites are in these results.")
+            else:
+                fav_df = fav_df.sort_values("buy_score", ascending=False, na_position="last")
+                st.dataframe(
+                    pd.DataFrame(
+                        {
+                            "Symbol": fav_df["symbol"],
+                            "Type": fav_df["type"],
+                            "Verdict": fav_df["verdict_short"],
+                            "Quality %": fav_df["quality_pct"].map(_f),
+                            "Valuation %": fav_df["valuation_pct"].map(_f),
+                            "Timing %": fav_df["timing_pct"].map(_f),
+                            "Price": fav_df["price"].map(lambda x: _f(x, "{:.2f}")),
+                            "Upside to fair": fav_df["upside_pct"].map(lambda x: _f(x, "{:+.0f}", "%")),
+                            "Profit-taking": fav_df["trim_level"],
+                            "Note": fav_df["error"],
+                        }
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+    with st.expander("Scan my Favorites now (live, slow)", expanded=False):
+        st.caption("Scores every symbol in your Favorites list with the same rules. Expect roughly 5-10 seconds per stock.")
+        if st.button("Run live scan of my Favorites", key="run_live_scan"):
+            results = []
+            bar = st.progress(0.0, text="Starting...")
+            bench = download_daily("SPY")
+            for i, sym in enumerate(favorites, start=1):
+                bar.progress(i / max(len(favorites), 1), text=f"Scoring {sym} ({i}/{len(favorites)})")
+                results.append(score_symbol(sym, r_default, bench))
+            st.session_state["live_rankings"] = clean_results(pd.DataFrame(results))
+            bar.empty()
+            st.rerun()
+        if live_df is not None and st.button("Clear live results", key="clear_live_scan"):
+            st.session_state.pop("live_rankings", None)
+            st.rerun()
+    st.caption(
+        "How the lists are built: see the Explanation tab. Rankings are a screening aid, not advice, and depend on the "
+        "default valuation assumptions for each stock."
+    )
+
+
+def portfolio_action(level: str, gain_pct, weight_pct) -> str:
+    heavy = weight_pct is not None and weight_pct > 15.0
+    if level == "Trim":
+        if gain_pct is not None and gain_pct > 0:
+            text = "Consider trimming 10-25% to lock in part of the gain"
+        else:
+            text = "Overbought and above fair value, but you are at a loss: review before selling"
+    elif level == "Review":
+        text = "Quality has weakened: re-check why you own it"
+    elif level == "Watch":
+        text = "Keep watching; decide your trim level in advance"
+    else:
+        text = "Hold"
+    if heavy:
+        text += "; position is over 15% of the portfolio, consider rebalancing"
+    return text
+
+
+def render_portfolio_tab(r_default: float):
+    st.subheader("Portfolio: your positions and profit-taking signals")
+    st.caption(
+        "Enter your positions below. They are kept only in this browser session and are never saved to GitHub. "
+        "Download the CSV to keep a copy on your computer, and upload it next session."
+    )
+    if "pf_base" not in st.session_state:
+        st.session_state["pf_base"] = pd.DataFrame({"Symbol": pd.Series(dtype=str), "Shares": pd.Series(dtype=float), "Avg cost": pd.Series(dtype=float)})
+        st.session_state["pf_version"] = 0
+
+    up = st.file_uploader("Load saved positions (CSV with columns Symbol, Shares, Avg cost)", type="csv", key="pf_upload")
+    if up is not None and st.session_state.get("pf_loaded") != (up.name, up.size):
+        try:
+            loaded = pd.read_csv(up)
+            loaded.columns = [str(c).strip() for c in loaded.columns]
+            colmap = {c.lower().replace("_", " "): c for c in loaded.columns}
+            loaded = loaded.rename(columns={colmap.get("symbol", "Symbol"): "Symbol", colmap.get("shares", "Shares"): "Shares", colmap.get("avg cost", "Avg cost"): "Avg cost"})
+            st.session_state["pf_base"] = loaded[["Symbol", "Shares", "Avg cost"]]
+            st.session_state["pf_version"] += 1
+            st.session_state["pf_loaded"] = (up.name, up.size)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not read that file: {exc}")
+
+    edited = st.data_editor(
+        st.session_state["pf_base"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"pf_editor_{st.session_state['pf_version']}",
+        column_config={
+            "Symbol": st.column_config.TextColumn("Symbol"),
+            "Shares": st.column_config.NumberColumn("Shares", min_value=0.0, step=1.0, format="%.4f"),
+            "Avg cost": st.column_config.NumberColumn("Avg cost per share", min_value=0.0, step=0.01, format="%.2f"),
+        },
+    )
+
+    pos = edited.copy()
+    pos["Symbol"] = pos["Symbol"].fillna("").astype(str).str.strip().str.upper()
+    pos["Shares"] = pd.to_numeric(pos["Shares"], errors="coerce")
+    pos["Avg cost"] = pd.to_numeric(pos["Avg cost"], errors="coerce")
+    pos = pos[(pos["Symbol"] != "") & (pos["Shares"] > 0) & (pos["Avg cost"] > 0)]
+    if pos.empty:
+        st.info("Add at least one position (symbol, shares and average cost) to see gains and profit-taking signals.")
+        return
+    pos["Cost total"] = pos["Shares"] * pos["Avg cost"]
+    pos = pos.groupby("Symbol", as_index=False).agg({"Shares": "sum", "Cost total": "sum"})
+    pos["Avg cost"] = pos["Cost total"] / pos["Shares"]
+
+    st.download_button(
+        "Download positions as CSV",
+        data=pos[["Symbol", "Shares", "Avg cost"]].to_csv(index=False),
+        file_name="my_positions.csv",
+        mime="text/csv",
+    )
+
+    rows = []
+    with st.spinner("Scoring your positions..."):
+        for _, p in pos.iterrows():
+            s = score_symbol_cached(p["Symbol"], r_default)
+            price = s.get("price")
+            if price is None:
+                rows.append({"Symbol": p["Symbol"], "Shares": p["Shares"], "Avg cost": p["Avg cost"], "Price": None, "Value": None,
+                             "Cost total": p["Cost total"], "Sector": s.get("sector") or s.get("type"), "Level": "", "Reason": s.get("error") or "No price"})
+                continue
+            value = p["Shares"] * price
+            rows.append(
+                {
+                    "Symbol": p["Symbol"], "Shares": p["Shares"], "Avg cost": p["Avg cost"], "Price": price, "Value": value,
+                    "Cost total": p["Cost total"], "Sector": s.get("sector") or s.get("type") or "",
+                    "Verdict": s.get("verdict_short", ""), "Level": s.get("trim_level", ""), "Reason": s.get("trim_reason", ""),
+                    "Upside": s.get("upside_pct"),
+                }
+            )
+    tbl = pd.DataFrame(rows)
+    valued = tbl.dropna(subset=["Value"])
+    total_value = float(valued["Value"].sum())
+    total_cost = float(valued["Cost total"].sum())
+    gain = total_value - total_cost
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Portfolio value", f"${total_value:,.0f}")
+    m2.metric("Total gain", f"${gain:,.0f}", f"{(gain / total_cost * 100.0) if total_cost else 0.0:+.1f}%")
+    m3.metric("Positions", f"{len(tbl)}")
+
+    tbl["Gain $"] = tbl["Value"] - tbl["Cost total"]
+    tbl["Gain %"] = (tbl["Value"] / tbl["Cost total"] - 1.0) * 100.0
+    tbl["Weight %"] = tbl["Value"] / total_value * 100.0 if total_value else None
+    tbl["Suggested action"] = [
+        portfolio_action(r["Level"], None if pd.isna(r["Gain %"]) else r["Gain %"], None if pd.isna(r["Weight %"]) else r["Weight %"])
+        if r["Level"] else r["Reason"]
+        for _, r in tbl.iterrows()
+    ]
+    order = {"Trim": 0, "Review": 1, "Watch": 2, "Hold": 3, "": 4}
+    tbl["_o"] = tbl["Level"].map(order)
+    tbl = tbl.sort_values(["_o", "Gain %"], ascending=[True, False])
+    show = pd.DataFrame(
+        {
+            "Symbol": tbl["Symbol"],
+            "Shares": tbl["Shares"].map(lambda x: _f(x, "{:,.2f}")),
+            "Avg cost": tbl["Avg cost"].map(lambda x: _f(x, "{:,.2f}")),
+            "Price": tbl["Price"].map(lambda x: _f(x, "{:,.2f}")),
+            "Value": tbl["Value"].map(lambda x: _f(x, "${:,.0f}")),
+            "Gain %": tbl["Gain %"].map(lambda x: _f(x, "{:+.1f}", "%")),
+            "Weight %": tbl["Weight %"].map(lambda x: _f(x, "{:.1f}", "%")),
+            "Signal": tbl["Level"],
+            "Suggested action": tbl["Suggested action"],
+        }
+    )
+
+    def _lvl_color(v):
+        return {
+            "Trim": "background-color: #f8d7da; color: #721c24",
+            "Review": "background-color: #fff3cd; color: #856404",
+            "Watch": "background-color: #e2e3e5; color: #383d41",
+        }.get(v, "")
+
+    styler = show.style.map(_lvl_color, subset=["Signal"]) if hasattr(show.style, "map") else show.style.applymap(_lvl_color, subset=["Signal"])
+    st.dataframe(styler, hide_index=True, use_container_width=True)
+
+    sec = valued.groupby(valued["Sector"].replace("", "Unknown"))["Value"].sum().sort_values(ascending=False)
+    if total_value and not sec.empty:
+        st.markdown("**Sector weights**")
+        sec_df = pd.DataFrame({"Sector": sec.index, "Weight %": (sec.values / total_value * 100.0).round(1)})
+        st.dataframe(sec_df, hide_index=True, use_container_width=True)
+        big = sec_df[sec_df["Weight %"] > 35]
+        if not big.empty:
+            st.warning("Concentration: " + ", ".join(f"{r['Sector']} is {r['Weight %']:.0f}% of the portfolio" for _, r in big.iterrows()) + " (over 35%).")
+    st.caption(
+        "Signals use the same rules as the Rankings tab. Trim = 3 of 3 overbought signals and price above fair value; "
+        "Review = Quality score under 50%; Watch = 2 overbought signals, or price above fair value with 1. "
+        "Taxes and your own plan matter: this is a prompt to think, not an instruction to sell."
+    )
 
 
 def plot_long_term_trend(stock: str, trend: dict):
@@ -1745,7 +2325,7 @@ def main():
     st.caption("Bollinger Bands (200/2), RSI (10), and MACD (8/21/5) on 4-hour candles.")
 
     if "favorites" not in st.session_state:
-        st.session_state["favorites"] = []
+        st.session_state["favorites"] = load_favorites_file()
     favorites = list(st.session_state["favorites"]) if st.session_state["favorites"] else []
     favorites = [str(s).strip().upper() for s in favorites if s]
     symbols = load_default_symbols()
@@ -1830,10 +2410,12 @@ def main():
         st.session_state["val_r_pct"] = float(r_default)
     st.session_state["val_defaults_for"] = active_stock
 
-    tab_charts, tab_lt, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_rank, tab_port, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
         [
             "Charts",
             "Long-term checklist",
+            "Rankings",
+            "Portfolio",
             "Financial metrics",
             "Valuation",
             "Paper investing check",
@@ -1908,6 +2490,11 @@ def main():
             "Three pillars: business quality, valuation, and timing. Thresholds are rules of thumb "
             "(see Explanation tab). Valuation checks use the assumptions from the Valuation tab."
         )
+        if get_instrument_info(active_stock)["type"] in ETF_TYPES:
+            st.info(
+                "This is an ETF / fund. Quality and Valuation checks need company statements, so only the Timing "
+                "pillar applies. Use the trend and timing checks, and judge the fund by what it holds."
+            )
         g_in = st.session_state.get("val_g_pct", 10.0)
         k_in = st.session_state.get("val_k_multiple", 15.0)
         r_in = st.session_state.get("val_r_pct", r_default)
@@ -1975,6 +2562,12 @@ def main():
                     }
                 )
                 st.caption("Yahoo provides about 4 fiscal years, so growth rates cover roughly 3 years.")
+
+    with tab_rank:
+        render_rankings_tab(st.session_state["favorites"], r_default)
+
+    with tab_port:
+        render_portfolio_tab(r_default)
 
     with tab_fin:
         st.subheader(f"Financial metrics - {active_stock}")
@@ -2294,7 +2887,10 @@ def main():
 
     with tab_fav:
         st.subheader("Favorites")
-        st.caption("Favorites appear at the top of the ticker dropdown. Add the current stock or pick one to load.")
+        st.caption(
+            "Your list loads from Favorites.csv and appears at the top of the ticker dropdown. Changes made here last only "
+            "for this session; edit Favorites.csv on GitHub to change the permanent list."
+        )
         fav_list = st.session_state["favorites"]
         if active_stock and active_stock not in fav_list:
             if st.button("Add current stock to Favorites", key="add_fav"):
@@ -2331,6 +2927,8 @@ def main():
 |---|---|---|
 | **Charts** | Is the price stretched or turning right now? | Timing an entry over the next days to weeks |
 | **Long-term checklist** | Is this a good business, at a good price, at a sensible moment? | First screen for any stock; the main decision tab |
+| **Rankings** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your Favorites and the wider stock list |
+| **Portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
 | **Financial metrics** | How healthy are the company's profit, growth, cash and debt? | Checking the business behind the ticker |
 | **Valuation** | What could it be worth, and what is the most I should pay? | Setting a buy price from your own assumptions |
 | **Paper investing check** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
@@ -2342,7 +2940,8 @@ def main():
 2. Open **Long-term checklist**. Read the verdict and the three scores (Quality, Valuation, Timing). A failed check is a question to investigate, not an automatic no.
 3. Open **Financial metrics** and **Valuation** to understand the business and set your own growth, multiple and margin-of-safety assumptions. Compare the current price with the **Buy price**.
 4. Use **Charts** to judge timing, and **Paper investing check** to see whether those timing signals have actually worked for this stock.
-5. Cross-check with **Analyst view**. Add stocks you follow to **Favorites**.
+5. Check **Rankings** for new ideas (and for alerts on your Favorites) and **Portfolio** for profit-taking signals on what you own.
+6. Cross-check with **Analyst view**. Keep the stocks you follow in **Favorites**.
 
 **Ideal long-term buy:** a high-quality business (Quality), priced below your buy price (Valuation), at a moment when the trend is intact and the price has pulled back (Timing).
 """)
@@ -2433,6 +3032,8 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **4-hour triggers, at least 2 of 3:** the Charts tiles (Below BB Low, RSI under 30, MACD above Signal).
 
 **Banks and insurers (Financial Services):** ROIC, leverage, interest coverage, FCF and DCF checks show N/A, because debt and cash are part of how they operate. Use the EPS model for them.
+
+**ETFs and funds:** they have no company statements, so Quality and Valuation show N/A and only the Timing pillar applies.
 """)
 
         with st.expander("Financial metrics tab: the business behind the ticker"):
@@ -2541,12 +3142,56 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 - Targets and ratings lag the market, and small companies may have few or no analysts.
 """)
 
+        with st.expander("Rankings tab: top 10 buy and top 10 avoid"):
+            st.markdown("""
+**What it helps you do:** find the best buy candidates and the most overvalued names across a large list of stocks, and see how your Favorites compare, without opening stocks one at a time.
+
+**Where the data comes from:** a daily scan (a GitHub Action) scores every symbol in Favorites.csv and stockList.csv with the same Long-term checklist and each stock's suggested valuation defaults, then saves rankings.csv. This tab shows that file. **Scan my Favorites now** scores only your Favorites on demand (slow, and it replaces the file view until you clear it).
+
+**Who can be ranked:** operating companies with enough scored checks (at least 4 Quality checks and 3 Valuation checks). ETFs are scored on Timing only and are never ranked. Banks and insurers have several checks that show N/A, so they usually fall below the minimum: they still get a verdict but are not ranked.
+
+**Top 10 buy candidates:** stocks with a Quality score of at least 50%, ordered by a buy score = 45% Quality + 40% Valuation + 15% Timing. Quality and price matter most; timing is a smaller tie-breaker, matching the verdict logic.
+
+**Top 10 avoid / overvalued:** stocks whose Valuation score is 33% or lower, or whose Quality score is below 50%, ordered by an avoid score = 50% (100 - Valuation) + 30% (100 - Quality) + 20% overbought (how many of the 3 sell signals are on). This is a list of stocks not to start buying now, or to review if you own them. It is not an automatic sell list.
+
+**Columns:** Q / V / T is the Quality, Valuation and Timing score in percent. **Upside to fair** is the average gap between fair value and the price across the available models (negative means the price is above fair value). **Overbought** is how many of the 3 profit-taking signals are on. A star marks your Favorites and **NEW** marks stocks that entered the list in the latest scan.
+
+**Profit-taking watch:** your Favorites with a Trim, Review or Watch signal (rules under the Portfolio tab).
+
+**Alerts:** the same daily scan opens a GitHub issue, which GitHub emails to you, when one of your Favorites newly enters the top 10 buy list or the top 10 avoid list, or newly reaches the Trim level.
+
+**Limits:** results depend on the default growth, multiple and margin of safety for each stock. Fast growers tend to look expensive because those defaults are capped. Treat the lists as a place to start research.
+""")
+
+        with st.expander("Portfolio tab: your positions and profit-taking signals"):
+            st.markdown("""
+**What it helps you do:** see your gain or loss on each position and which holdings are worth trimming, reviewing or just watching.
+
+**How to use it:**
+1. Type your positions in the table: **Symbol**, **Shares** and **Avg cost per share**. Add or delete rows as needed.
+2. Positions stay only in this browser session and are never saved to GitHub. Click **Download positions as CSV** to keep a copy on your computer, and upload it next session.
+
+**What it shows:** portfolio value and total gain, then one row per position: value, gain percent, weight in the portfolio, a **Signal** and a **Suggested action**. Duplicate symbols are combined. A sector table warns when one sector is more than 35% of the portfolio.
+
+**Profit-taking signals** (the same rules as your old StockSeller reports, plus valuation and quality):
+- **Overbought signals (0 to 3):** close above the upper Bollinger Band (15 days, 2 standard deviations), daily RSI above 70, and MACD below its signal line.
+- **Trim:** all 3 overbought signals **and** the price is above fair value in every available valuation model. Consider trimming about 10-25%.
+- **Review:** the Quality score is below 50%. Re-check why you own it.
+- **Watch:** 2 or more overbought signals, or 1 signal with the price above fair value.
+- **Hold:** none of the above.
+
+A position over 15% of the portfolio adds a rebalancing note. If you are at a loss, a Trim signal asks you to review rather than sell.
+
+**Read it with care:** signals are prompts, not instructions. Selling a core long-term holding has tax and opportunity costs, and fast growers can stay overbought for a long time.
+""")
+
         with st.expander("Favorites tab: your shortlist"):
             st.markdown("""
 **What it helps you do:** keep the stocks you follow one click away instead of searching the dropdown every time.
-- **Add current stock to Favorites** saves the stock you are viewing. Favorites then appear at the top of the ticker dropdown.
+- Your list comes from **Favorites.csv** in the project and appears at the top of the ticker dropdown. The Rankings tab and the daily scan use the same file.
+- **Add current stock to Favorites** adds the stock you are viewing for this session only.
 - **Load** opens that stock in every tab. **Remove** deletes it from the list.
-- **Important:** Favorites are kept only for your current browser session. Refreshing the page or opening the app in a new window starts with an empty list, so note down your tickers if you want to keep them.
+- **Important:** additions and removals made in the app last only for the current browser session. To change the permanent list, edit Favorites.csv on GitHub.
 """)
 
         with st.expander("Data sources, limits and caveats"):
