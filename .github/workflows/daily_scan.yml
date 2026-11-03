@@ -1,5 +1,8 @@
 name: Daily stock scan
 
+# This workflow uses no third-party actions (only plain shell commands), so it works even when the
+# repository only allows actions owned by its own account.
+
 on:
   schedule:
     # 21:30 UTC on weekdays = after the US market close (4:30-5:30 pm Eastern)
@@ -20,24 +23,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      - uses: actions/checkout@v4
+      - name: Get the code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --branch "${{ github.ref_name }}" "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Python packages
+        run: |
+          python3 --version
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r requirements.txt
 
       - name: Run scan
         env:
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
           if [ -n "$LIMIT" ]; then
-            python scan_universe.py --limit "$LIMIT"
+            .venv/bin/python scan_universe.py --limit "$LIMIT"
           else
-            python scan_universe.py
+            .venv/bin/python scan_universe.py
           fi
 
       - name: Save results
