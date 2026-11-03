@@ -107,6 +107,7 @@ def main() -> int:
     top_buy = buy["symbol"].tolist() if not buy.empty else []
     top_avoid = avoid["symbol"].tolist() if not avoid.empty else []
     trim = df.loc[df["trim_level"] == "Trim", "symbol"].tolist()
+    buy_zone = df.loc[df["buy_zone"] == "In zone", "symbol"].tolist()
 
     state_path = out_dir / app.STATE_FILE
     prev = None
@@ -119,12 +120,15 @@ def main() -> int:
     new_buy = [s for s in top_buy if s not in p_buy]
     new_avoid = [s for s in top_avoid if s not in p_avoid]
     new_trim = [s for s in trim if s not in p_trim]
+    p_zone = set(prev.get("buy_zone", [])) if prev else set()
+    new_zone = [s for s in buy_zone if s not in p_zone]
 
     asof = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     state = {
         "asof": asof, "universe": len(df), "scored": n_ok, "r_default": r_default,
         "top_buy": top_buy, "top_avoid": top_avoid, "trim": trim,
         "new_buy": new_buy, "new_avoid": new_avoid, "new_trim": new_trim,
+        "buy_zone": buy_zone, "new_buy_zone": new_zone,
     }
 
     # ---- write results ----
@@ -145,15 +149,16 @@ def main() -> int:
     a_buy = [s for s in new_buy if s in fav_set]
     a_avoid = [s for s in new_avoid if s in fav_set]
     a_trim = [s for s in new_trim if s in fav_set]
+    a_zone = [s for s in new_zone if s in fav_set]
     alert_md, alert_title = out_dir / "alert.md", out_dir / "alert_title.txt"
     for p in (alert_md, alert_title):
         if p.exists():
             p.unlink()
-    if a_buy or a_avoid or a_trim:
+    if a_buy or a_avoid or a_trim or a_zone:
         parts = []
         if args.owner:
             parts.append(f"@{args.owner}")
-        parts.append(f"Daily scan {asof}: your favorites changed position in the rankings.\n")
+        parts.append(f"Daily scan {asof}: your favorites changed position (lists, buy price or profit-taking level).\n")
         if a_buy:
             parts.append("### Newly in the Top 10 BUY list")
             parts += [_line(_row(s)) for s in a_buy]
@@ -161,6 +166,15 @@ def main() -> int:
         if a_avoid:
             parts.append("### Newly in the Top 10 AVOID list")
             parts += [_line(_row(s)) for s in a_avoid]
+            parts.append("")
+        if a_zone:
+            parts.append("### Newly at or below your BUY price")
+            for s in a_zone:
+                r = by_sym.loc[s]
+                parts.append(
+                    f"- **{s}** ({(r['name'] or '')[:30]}) - price {r['price']:.2f} vs buy price {r['buy_eps10']:.2f} "
+                    f"({r['buy_gap_pct']:+.1f}%); Quality {r['quality_pct']:.0f}%, {r['verdict_short']}, stock type {r['stock_type'] or '-'}"
+                )
             parts.append("")
         if a_trim:
             parts.append("### Newly at the TRIM level (profit-taking)")
@@ -177,6 +191,8 @@ def main() -> int:
             bits.append("AVOID: " + ", ".join(a_avoid))
         if a_trim:
             bits.append("TRIM: " + ", ".join(a_trim))
+        if a_zone:
+            bits.append("BUY PRICE: " + ", ".join(a_zone))
         alert_title.write_text("Stock alert - " + " | ".join(bits), encoding="utf-8")
         print("ALERT:", " | ".join(bits))
     else:
@@ -185,6 +201,7 @@ def main() -> int:
     print("Top 10 buy:  ", ", ".join(top_buy))
     print("Top 10 avoid:", ", ".join(top_avoid))
     print("Trim level:  ", ", ".join(trim) or "-")
+    print("In buy zone: ", ", ".join(buy_zone) or "-")
     return 0
 
 

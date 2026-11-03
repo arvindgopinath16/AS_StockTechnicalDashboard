@@ -334,6 +334,24 @@ def _retry(fn, tries: int = 2, wait: float = 1.5):
     raise last_exc
 
 
+_NEG_CACHE: dict = {}  # (function, symbol) -> time of last failure; keeps a failing lookup from being retried on every click
+_NEG_TTL = 120.0
+
+
+def _guarded(fn, stock: str, empty):
+    """Call a cached fetcher that RAISES when Yahoo fails (so st.cache_data never stores the failure).
+    On failure return empty() and skip retrying that symbol for a couple of minutes."""
+    key = (getattr(fn, "__name__", str(fn)), stock)
+    t = _NEG_CACHE.get(key)
+    if t is not None and time.time() - t < _NEG_TTL:
+        return empty()
+    try:
+        return fn(stock)
+    except Exception:
+        _NEG_CACHE[key] = time.time()
+        return empty()
+
+
 def _has_data(v) -> bool:
     if v is None:
         return False
@@ -629,7 +647,7 @@ def _format_estimates(df: pd.DataFrame, money: bool = False) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_financial_metrics(stock: str) -> dict:
+def _fetch_financial_metrics_cached(stock: str) -> dict:
     """
     Mirror the financial-metric logic from StockPickerComprehensive_v6.check_stocks
     for a single ticker so the web app matches the report.
@@ -637,12 +655,18 @@ def fetch_financial_metrics(stock: str) -> dict:
     ticker = yf.Ticker(stock)
 
     # Try to get the three core statements
+    def _load_statements():
+        fin_raw = ticker.financials
+        return (
+            fin_raw.T if isinstance(fin_raw, pd.DataFrame) else pd.DataFrame(),
+            ticker.balance_sheet.T,
+            ticker.cashflow.T,
+        )
+
     try:
-        financials = ticker.financials.T if isinstance(ticker.financials, pd.DataFrame) else pd.DataFrame()
-        balance_sheet = ticker.balance_sheet.T
-        cashflow = ticker.cashflow.T
-    except Exception:
-        return {}
+        financials, balance_sheet, cashflow = _retry(_load_statements, tries=2)
+    except Exception as exc:
+        raise RuntimeError(f"Yahoo statements unavailable: {exc}")
 
     # Sort from oldest -> newest for consistent multi‑year calculations
     if not financials.empty:
@@ -655,9 +679,14 @@ def fetch_financial_metrics(stock: str) -> dict:
     # Load static info dict once (used for market cap, dividend rate, etc.)
     info: dict = {}
     try:
-        info = ticker.info or {}
-    except Exception:
-        info = {}
+        info = _retry(lambda: ticker.info, tries=2) or {}
+    except Exception as exc:
+        raise RuntimeError(f"Yahoo company info unavailable: {exc}")
+    if (
+        financials.empty and balance_sheet.empty and cashflow.empty
+        and str(info.get("quoteType") or "").upper() == "EQUITY"
+    ):
+        raise RuntimeError("Yahoo returned no statements for this company")
 
     # Market cap: prefer fast_info, fall back to info
     market_cap = None
@@ -682,6 +711,7 @@ def fetch_financial_metrics(stock: str) -> dict:
         "EPS (1Y)": None,
         "Net Debt": None,
         "Sector": info.get("sector"),
+        "Industry": info.get("industry"),
     }
 
     # Net income based metrics (P/E and profit growth)
@@ -877,6 +907,11 @@ def fetch_financial_metrics(stock: str) -> dict:
     return metrics
 
 
+def fetch_financial_metrics(stock: str) -> dict:
+    """Company ratios from Yahoo statements. Returns {} when Yahoo fails (failures are never cached)."""
+    return _guarded(_fetch_financial_metrics_cached, stock, dict)
+
+
 # ---------------------------------------------------------------------------
 # Long-term entry framework: quality, valuation context, trend, checklist
 # ---------------------------------------------------------------------------
@@ -966,16 +1001,16 @@ def download_daily(stock: str, years: int = 5) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_quality_metrics(stock: str) -> dict:
+def _fetch_quality_metrics_cached(stock: str) -> dict:
     """Business quality and balance-sheet strength from Yahoo annual statements (about 4 fiscal years)."""
     out: dict = {"available": False}
+    t = yf.Ticker(stock)
     try:
-        t = yf.Ticker(stock)
-        inc, bs, cf = t.income_stmt, t.balance_sheet, t.cashflow
-    except Exception:
-        return out
+        inc, bs, cf = _retry(lambda: (t.income_stmt, t.balance_sheet, t.cashflow), tries=2)
+    except Exception as exc:
+        raise RuntimeError(f"Yahoo statements unavailable: {exc}")
     try:
-        info = t.info or {}
+        info = _retry(lambda: t.info, tries=2) or {}
     except Exception:
         info = {}
 
@@ -1005,6 +1040,8 @@ def fetch_quality_metrics(stock: str) -> dict:
     cur_liab = _get_row(bs, ["Current Liabilities"])
 
     if revenue.empty and net_inc.empty:
+        if str(info.get("quoteType") or "").upper() == "EQUITY":
+            raise RuntimeError("Yahoo returned no statements for this company")
         return out
 
     rev_y, gross_y, op_y, ni_y, fcf_y = (_by_year(s) for s in (revenue, gross, op_inc, net_inc, fcf))
@@ -1111,8 +1148,13 @@ def fetch_quality_metrics(stock: str) -> dict:
     return out
 
 
+def fetch_quality_metrics(stock: str) -> dict:
+    """Business quality from Yahoo statements. Returns {"available": False} when Yahoo fails (never cached)."""
+    return _guarded(_fetch_quality_metrics_cached, stock, lambda: {"available": False})
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_valuation_context(stock: str) -> dict:
+def _fetch_valuation_context_cached(stock: str) -> dict:
     """Forward P/E, PEG, EV/EBITDA, 10Y yield, and the stock's own P/E history (annual EPS basis)."""
     out: dict = {
         "forward_pe": None, "peg": None, "ev_ebitda": None, "treasury_10y": None,
@@ -1121,9 +1163,9 @@ def fetch_valuation_context(stock: str) -> dict:
     }
     try:
         t = yf.Ticker(stock)
-        info = t.info or {}
-    except Exception:
-        return out
+        info = _retry(lambda: t.info, tries=2) or {}
+    except Exception as exc:
+        raise RuntimeError(f"Yahoo company info unavailable: {exc}")
 
     out["forward_pe"] = _safe_float(info.get("forwardPE"))
     out["peg"] = _safe_float(info.get("trailingPegRatio")) or _safe_float(info.get("pegRatio"))
@@ -1166,6 +1208,17 @@ def fetch_valuation_context(stock: str) -> dict:
     except Exception:
         pass
     return out
+
+
+def fetch_valuation_context(stock: str) -> dict:
+    """Forward P/E, PEG and own P/E history. Returns an all-empty dict when Yahoo fails (never cached)."""
+    return _guarded(
+        _fetch_valuation_context_cached, stock,
+        lambda: {
+            "forward_pe": None, "peg": None, "ev_ebitda": None, "treasury_10y": None, "pe_hist": None, "pe_current": None,
+            "pe_percentile": None, "pe_median": None, "pe_p25": None, "pe_p75": None, "pe_years": None,
+        },
+    )
 
 
 def compute_trend_context(daily: pd.DataFrame, bench: pd.DataFrame) -> dict:
@@ -1485,15 +1538,75 @@ def pillar_score(checks: list):
     return passed / len(scored) * 100.0, passed, len(scored)
 
 
-def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict) -> dict:
-    """Stock-specific starting assumptions: growth g (%), terminal multiple K, margin of safety (%)."""
+STOCK_TYPES = ("Core", "Growth", "Cyclical", "Financial")
+_CYCLICAL_INDUSTRY_WORDS = (
+    "airline", "steel", "aluminum", "copper", "gold", "silver", "coal", "industrial metals", "marine shipping",
+    "trucking", "residential construction", "oil & gas", "uranium",
+)
+
+
+def classify_stock_type(fin: dict, quality: dict) -> tuple:
+    """(type, reason). Financial > Cyclical (sector / industry) > Growth (sales growing 12%+ a year) > Core."""
+    fin, q = fin or {}, quality or {}
+    sector = str(fin.get("Sector") or "").lower()
+    industry = str(fin.get("Industry") or "").lower()
+    if is_financial(fin):
+        return "Financial", "bank, insurer or other financial company"
+    if sector == "energy" or any(w in industry for w in _CYCLICAL_INDUSTRY_WORDS):
+        label = fin.get("Industry") or fin.get("Sector") or "this industry"
+        return "Cyclical", f"{label}: profits swing with the economic cycle"
+    rev = q.get("rev_cagr")
+    if rev is not None and rev >= 12.0:
+        return "Growth", f"sales growing {rev:.1f}% a year (12% or more)"
+    return "Core", "steady business (sales growth under 12% a year)"
+
+
+def fade_growth_equivalent(g1_pct: float, terminal_pct: float = 5.0, hold_years: int = 5, total_years: int = 10) -> float:
+    """Flat yearly rate (%) that gives the same 10-year growth as: g1 for `hold_years`, then a straight-line fade to the terminal rate."""
+    factor = 1.0
+    for t in range(1, total_years + 1):
+        if t <= hold_years:
+            g = g1_pct
+        else:
+            g = g1_pct - (g1_pct - terminal_pct) * (t - hold_years) / (total_years - hold_years)
+        factor *= 1.0 + g / 100.0
+    return (factor ** (1.0 / total_years) - 1.0) * 100.0
+
+
+def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict, profile: str = None) -> dict:
+    """Stock-specific starting assumptions: growth g (%), terminal multiple K, margin of safety (%).
+    The stock type (Core / Growth / Cyclical / Financial) decides how g and K are limited."""
     q = quality or {}
     v = valctx or {}
-    notes: list = []
+    auto_type, why = classify_stock_type(fin, q)
+    stype = profile if profile in STOCK_TYPES else auto_type
+    if stype == auto_type:
+        notes: list = [f"Stock type {stype} ({why})"]
+    else:
+        notes = [f"Stock type {stype} (your choice; detected {auto_type})"]
 
     growth = [x for x in (q.get("rev_cagr"), q.get("eps_cagr"), q.get("fcf_cagr")) if x is not None]
-    if growth:
-        raw_g = float(pd.Series(growth).median())
+    raw_g = float(pd.Series(growth).median()) if growth else None
+    rev = q.get("rev_cagr")
+
+    if stype == "Growth":
+        base = raw_g if raw_g is not None else (rev if rev is not None else 12.0)
+        g1 = min(25.0, max(10.0, base))
+        g = round(fade_growth_equivalent(g1) * 2) / 2.0
+        cap_txt = ", capped at 25%" if base > 25.0 else ""
+        notes.append(
+            f"g {g:g}% = 10-year average of {g1:.0f}% a year for 5 years (historical median growth {base:.1f}%{cap_txt}) "
+            "then fading to 5% by year 10"
+        )
+    elif stype == "Cyclical":
+        base = rev if rev is not None else (raw_g if raw_g is not None else 3.0)
+        g = round(min(5.0, max(2.0, base)) * 2) / 2.0
+        notes.append(f"g {g:g}% (recent growth {base:.1f}% is not extrapolated for a cyclical business; limited to 2-5%)")
+    elif stype == "Financial":
+        base = raw_g if raw_g is not None else 5.0
+        g = round(min(8.0, max(3.0, base)) * 2) / 2.0
+        notes.append(f"g {g:g}% (historical median growth {base:.1f}%, limited to 3-8% for a financial company)")
+    elif raw_g is not None:
         g = round(min(10.0, max(3.0, raw_g)) * 2) / 2.0
         if raw_g > 10.0:
             notes.append(f"g {g:g}% (historical median growth {raw_g:.1f}%, capped at 10% because a 10-year projection should not assume a hot streak lasts)")
@@ -1512,18 +1625,19 @@ def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict) -> dict:
         or (q.get("fcf_pos") is not None and q.get("fcf_n") and q["fcf_pos"] < q["fcf_n"])
     ) and not is_financial(fin)
 
+    lo, hi, fallback = {"Core": (12.0, 22.0, 18.0), "Growth": (15.0, 30.0, 25.0), "Cyclical": (6.0, 14.0, 10.0), "Financial": (8.0, 14.0, 11.0)}[stype]
     pe_med = v.get("pe_median")
     if pe_med is not None:
-        k = float(round(min(22.0, max(12.0, pe_med))))
-        if pe_med > 22.0:
-            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, capped at 22)")
-        elif pe_med < 12.0:
-            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, raised to the 12 floor)")
+        k = float(round(min(hi, max(lo, pe_med))))
+        if pe_med > hi:
+            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, capped at {hi:g} for this stock type)")
+        elif pe_med < lo:
+            notes.append(f"K {k:g} (own median P/E {pe_med:.1f}, raised to the {lo:g} floor for this stock type)")
         else:
             notes.append(f"K {k:g} = own median P/E ({pe_med:.1f})")
     else:
-        k = 18.0
-        notes.append("K 18 (generic; no P/E history)")
+        k = fallback
+        notes.append(f"K {k:g} (generic for this stock type; no P/E history)")
     if risky and k > 15.0:
         k = 15.0
         notes.append("K capped at 15 (leverage or negative FCF)")
@@ -1532,13 +1646,16 @@ def suggest_valuation_defaults(fin: dict, quality: dict, valctx: dict) -> dict:
     if risky:
         mos = 35.0
         notes.append("MoS 35% (leverage or negative FCF)")
+    elif stype == "Cyclical":
+        mos = 35.0
+        notes.append("MoS 35% (cyclical earnings can be at a peak)")
     elif q_pct is not None and q_pct >= 80:
         mos = 15.0
         notes.append("MoS 15% (high-quality business)")
     else:
         mos = 25.0
         notes.append("MoS 25% (default)")
-    return {"g": g, "k": k, "mos": mos, "notes": "; ".join(notes)}
+    return {"g": g, "k": k, "mos": mos, "notes": "; ".join(notes), "profile": stype, "auto_profile": auto_type, "profile_reason": why}
 
 
 def _reset_val_inputs(sugg: dict, r_default: float):
@@ -1546,6 +1663,40 @@ def _reset_val_inputs(sugg: dict, r_default: float):
     st.session_state["val_k_multiple"] = float(sugg["k"])
     st.session_state["val_mos_pct"] = float(sugg["mos"])
     st.session_state["val_r_pct"] = float(r_default)
+
+
+def _clear_data_caches():
+    """Forget cached company data and any recent failures, so the next load asks Yahoo again."""
+    for fn in (_fetch_financial_metrics_cached, _fetch_quality_metrics_cached, _fetch_valuation_context_cached, _fetch_analyst_raw):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+    _NEG_CACHE.clear()
+
+
+def render_data_gap_banner(stock: str):
+    """Shown when Yahoo returned no company statements for an operating company: explains, offers a retry, and shows the last saved scan."""
+    st.warning(
+        f"Yahoo Finance did not return company statements for {stock} right now. This is usually a temporary limit on shared "
+        "servers, not a problem with the stock. Nothing from the failed lookup is saved, so pressing Try again (or simply "
+        "waiting a couple of minutes) fetches fresh data."
+    )
+    st.button("Try again", key="retry_company_data", on_click=_clear_data_caches)
+    df, state = load_rankings()
+    if df is None or df.empty:
+        return
+    m = df[(df["symbol"] == stock) & (df["error"] == "")]
+    if m.empty:
+        return
+    r = m.iloc[0]
+    with st.expander(f"Last saved scan for {stock} ({state.get('asof') or 'date unknown'})", expanded=True):
+        c = st.columns(4)
+        c[0].metric("Verdict then", r["verdict_short"] or "N/A")
+        c[1].metric("Quality / Valuation / Timing", f"{_f(r['quality_pct'])} / {_f(r['valuation_pct'])} / {_f(r['timing_pct'])}")
+        c[2].metric("Price then", _f(r["price"], "${:.2f}"))
+        c[3].metric("Buy price then", _f(r["buy_eps10"], "${:.2f}"))
+        st.caption("Numbers from the last daily scan, shown only because live data is unavailable. They may be a day or more old.")
 
 
 def long_term_verdict(scores: dict):
@@ -1710,7 +1861,8 @@ def score_symbol(stock: str, r_default: float, bench=None) -> dict:
         "valuation_n": 0, "timing_pct": None, "timing_n": 0, "eligible": False, "buy_score": None,
         "avoid_score": None, "sell_signals": None, "rsi_daily": None, "above_fair": None, "upside_pct": None,
         "fair_eps10": None, "buy_eps10": None, "fair_dcf": None, "buy_dcf": None, "trim_level": "",
-        "trim_reason": "", "g_pct": None, "k": None, "mos_pct": None, "error": "",
+        "trim_reason": "", "g_pct": None, "k": None, "mos_pct": None, "buy_gap_pct": None, "buy_zone": "",
+        "stock_type": "", "error": "",
     }
     try:
         inst = get_instrument_info(stock)
@@ -1745,8 +1897,10 @@ def score_symbol(stock: str, r_default: float, bench=None) -> dict:
             fin = fetch_financial_metrics(stock) or {}
             quality = fetch_quality_metrics(stock) or {}
             valctx = fetch_valuation_context(stock) or {}
+            if not fin and not quality.get("available"):
+                raise ValueError("no company statements from Yahoo")
             sugg = suggest_valuation_defaults(fin, quality, valctx)
-            row.update(g_pct=sugg["g"], k=sugg["k"], mos_pct=sugg["mos"])
+            row.update(g_pct=sugg["g"], k=sugg["k"], mos_pct=sugg["mos"], stock_type=sugg["profile"])
             val_rows = summarize_valuation(fin, price, sugg["g"] / 100.0, sugg["k"], r_default / 100.0, sugg["mos"] / 100.0)
 
         checklist = build_long_term_checklist(price, fin, quality, valctx, trend, val_rows, sig)
@@ -1776,6 +1930,11 @@ def score_symbol(stock: str, r_default: float, bench=None) -> dict:
 
         # Only operating companies with enough scored checks can be ranked
         row["eligible"] = bool(not is_etf and q_pct is not None and v_pct is not None and q_n >= 4 and v_n >= 3)
+        buy_px = row.get("buy_eps10")
+        if buy_px and buy_px > 0 and not is_etf and q_pct is not None and q_pct >= 50:
+            gap = (price / buy_px - 1.0) * 100.0
+            row["buy_gap_pct"] = gap
+            row["buy_zone"] = "In zone" if gap <= 0 else ("Near" if gap <= 5 else "")
         if row["eligible"]:
             t_eff = 50.0 if t_pct is None else t_pct
             row["buy_score"] = 0.45 * q_pct + 0.40 * v_pct + 0.15 * t_eff
@@ -1794,18 +1953,23 @@ def score_symbol_cached(stock: str, r_default: float) -> dict:
 _NUM_COLS = (
     "price", "quality_pct", "quality_n", "valuation_pct", "valuation_n", "timing_pct", "timing_n", "buy_score",
     "avoid_score", "sell_signals", "rsi_daily", "upside_pct", "fair_eps10", "buy_eps10", "fair_dcf", "buy_dcf",
-    "g_pct", "k", "mos_pct",
+    "g_pct", "k", "mos_pct", "buy_gap_pct",
 )
 
 
 def clean_results(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    for c in ("buy_zone", "stock_type"):
+        if c not in out.columns:
+            out[c] = ""
+    if "buy_gap_pct" not in out.columns:
+        out["buy_gap_pct"] = float("nan")
     for c in _NUM_COLS:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     if "eligible" in out.columns:
         out["eligible"] = out["eligible"].map(lambda x: str(x).strip().lower() == "true" if not isinstance(x, bool) else x)
-    for c in ("name", "sector", "verdict", "verdict_short", "trim_level", "trim_reason", "error", "type", "price_date"):
+    for c in ("name", "sector", "verdict", "verdict_short", "trim_level", "trim_reason", "error", "type", "price_date", "buy_zone", "stock_type"):
         if c in out.columns:
             out[c] = out[c].fillna("").astype(str)
     return out
@@ -1923,6 +2087,34 @@ def render_rankings_tab(favorites: list, r_default: float):
                 st.dataframe(_rank_view(avoid, favs, new_avoid), hide_index=True, use_container_width=True)
 
         fav_df = df[df["symbol"].isin(favs)].copy()
+        new_zone = set(state.get("new_buy_zone", [])) if source == "daily scan" else set()
+        st.markdown("**Buy-price watch (your favorites)**")
+        zone = fav_df[fav_df["buy_zone"].isin(["In zone", "Near"])].copy()
+        if zone.empty:
+            st.info("No favorites are at, or within 5% above, their Buy price right now.")
+        else:
+            zone = zone.sort_values("buy_gap_pct")
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        "Symbol": zone["symbol"],
+                        "Status": zone["buy_zone"].map({"In zone": "At or below Buy price", "Near": "Within 5% above"}),
+                        "Price": zone["price"].map(lambda x: _f(x, "{:.2f}")),
+                        "Buy price": zone["buy_eps10"].map(lambda x: _f(x, "{:.2f}")),
+                        "Gap to Buy price": zone["buy_gap_pct"].map(lambda x: _f(x, "{:+.1f}", "%")),
+                        "Quality %": zone["quality_pct"].map(_f),
+                        "Stock type": zone["stock_type"],
+                        "Verdict": zone["verdict_short"],
+                        "New": zone["symbol"].map(lambda s: "NEW" if s in new_zone else ""),
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+        st.caption(
+            "Buy price = the 10-year EPS-model buy price (fair value less the margin of safety) for that stock type. "
+            "Only stocks with a Quality score of 50% or more are listed. Crossing below the Buy price triggers an alert."
+        )
         st.markdown("**Profit-taking watch (your favorites)**")
         order = {"Trim": 0, "Review": 1, "Watch": 2, "Hold": 3}
         watch = fav_df[fav_df["trim_level"].isin(["Trim", "Review", "Watch"])].copy()
@@ -2637,6 +2829,221 @@ def render_business_snapshot(active_stock: str, price: float, fin: dict, quality
             st.dataframe(yr.round(1), width="stretch")
 
 
+# ---------------------------------------------------------------------------
+# Entry and exit plan tab: staged buying and staged profit-taking
+# ---------------------------------------------------------------------------
+
+def build_entry_ladder(anchor: float, n: int, step_pct: float, total: float, price: float) -> list:
+    """n buy tranches. Tranche 1 triggers at `anchor`; each next one is `step_pct` lower than the previous trigger step."""
+    rows = []
+    per = total / n if n else 0.0
+    for i in range(n):
+        trigger = anchor * (1.0 - step_pct / 100.0 * i)
+        reached = price <= trigger
+        buy_at = min(price, trigger)
+        rows.append(
+            {
+                "Tranche": i + 1,
+                "Buy at or below": trigger,
+                "Distance from today %": (trigger / price - 1.0) * 100.0 if price else None,
+                "Amount": per,
+                "Shares": per / buy_at if buy_at > 0 else None,
+                "Status": "Reached: buy now" if reached else "Waiting",
+            }
+        )
+    return rows
+
+
+def build_exit_ladder(base: float, levels_pct: list, sell_pcts: list, price: float, shares: float, avg_cost: float) -> list:
+    """Profit-taking steps. Trigger = base x (1 + level%). Each step sells a % of the ORIGINAL position."""
+    rows = []
+    sold_total = 0.0
+    for i, (lv, sp) in enumerate(zip(levels_pct, sell_pcts), start=1):
+        sp = max(0.0, min(float(sp), 100.0 - sold_total))
+        sold_total += sp
+        trigger = base * (1.0 + float(lv) / 100.0)
+        sell_sh = shares * sp / 100.0 if shares else 0.0
+        rows.append(
+            {
+                "Step": i,
+                "Sell when price reaches": trigger,
+                "Distance from today %": (trigger / price - 1.0) * 100.0 if price else None,
+                "Sell % of position": sp,
+                "Shares to sell": sell_sh if shares else None,
+                "Cash received": sell_sh * trigger if shares else None,
+                "Gain locked in": (trigger - avg_cost) * sell_sh if (shares and avg_cost) else None,
+                "Status": "Reached: consider selling" if price >= trigger else "Waiting",
+            }
+        )
+    return rows
+
+
+def _usd(x) -> str:
+    return "-" if x is None or pd.isna(x) else f"${x:,.2f}"
+
+
+def _plan_df(rows: list, money_cols: tuple, pct_cols: tuple, shares_cols: tuple = ()) -> pd.DataFrame:
+    out = pd.DataFrame(rows)
+    for c in money_cols:
+        if c in out.columns:
+            out[c] = out[c].map(_usd)
+    for c in pct_cols:
+        if c in out.columns:
+            out[c] = out[c].map(lambda x: "-" if x is None or pd.isna(x) else f"{x:+.1f}%" if "Distance" in c else f"{x:.0f}%")
+    for c in shares_cols:
+        if c in out.columns:
+            out[c] = out[c].map(lambda x: "-" if x is None or pd.isna(x) else f"{x:,.2f}")
+    return out
+
+
+def render_plan_tab(active_stock: str, price: float, fin: dict, quality: dict, trend: dict, indicator_data, pillar_scores: dict, r_default: float):
+    st.subheader(f"Entry and exit plan - {active_stock}")
+    st.caption(
+        "Turns the checklist into a staged plan: buy in tranches at prices you decide in advance, and take profit in steps. "
+        "Deciding the levels before the price moves is what keeps emotion out. Planning aid only, not investment advice."
+    )
+    try:
+        is_fund = get_instrument_info(active_stock).get("type") in ETF_TYPES
+    except Exception:
+        is_fund = False
+
+    g_in = st.session_state.get("val_g_pct", 10.0)
+    k_in = st.session_state.get("val_k_multiple", 15.0)
+    r_in = st.session_state.get("val_r_pct", r_default)
+    mos_in = st.session_state.get("val_mos_pct", 25.0)
+    val_rows = [] if is_fund else summarize_valuation(fin, price, g_in / 100.0, k_in, r_in / 100.0, mos_in / 100.0)
+    by_model = {r["Model"]: r for r in val_rows}
+    pick = by_model.get("EPS model (10Y)") or by_model.get("DCF (10Y)")
+    buy_px = pick["Buy price"] if pick else None
+    fair_px = pick["Fair value"] if pick else None
+
+    q_pct, _, q_n = pillar_scores.get("quality", (None, 0, 0))
+    level, headline, detail = long_term_verdict(pillar_scores)
+    getattr(st, level)(f"**{headline}** - {detail}")
+
+    # ---- reference levels
+    bb_low = None
+    if indicator_data is not None and len(indicator_data):
+        bb_low = float(indicator_data["BB_Low"].iloc[-1])
+    ma200 = (trend or {}).get("ma200")
+    ser = (trend or {}).get("series")
+    lo52 = float(ser["Close"].tail(252).min()) if ser is not None and len(ser) else None
+    ref = st.columns(6)
+    ref[0].metric("Current price", _usd(price))
+    ref[1].metric("Buy price (model)", _usd(buy_px))
+    ref[2].metric("Fair value (model)", _usd(fair_px))
+    ref[3].metric("Lower Bollinger band (4h)", _usd(bb_low))
+    ref[4].metric("200-day average", _usd(ma200))
+    ref[5].metric("52-week low", _usd(lo52))
+    st.caption("Buy price and fair value come from the Fair value tab (10-year EPS model, or the DCF when there is no EPS). Edit the inputs there to move them.")
+
+    if q_pct is not None and q_pct < 50 and not is_fund:
+        st.warning(f"Quality score is only {q_pct:.0f}%. Cheap prices on a weak business are a trap, so treat the entry ladder below as reference only and do not add until the checklist improves.")
+
+    # ---------------- entry ----------------
+    st.markdown("### 1. Entry: buy in tranches")
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        total = st.number_input("Total to invest (dollars)", min_value=100.0, value=10000.0, step=500.0, key="plan_total")
+    with e2:
+        n_tr = int(st.number_input("Number of tranches", min_value=2, max_value=6, value=3, step=1, key="plan_n"))
+    with e3:
+        styles = ["Value: start at the Buy price", "Pullback: start at today's price"]
+        style = st.radio("Ladder style", styles, key="plan_style", help="Value waits for the model's Buy price. Pullback buys the first tranche now, then adds on dips.")
+    with e4:
+        step = st.number_input("Step between tranches (%)", min_value=1.0, max_value=30.0, value=7.5, step=0.5, key="plan_step")
+    use_value = style == styles[0]
+    if use_value and buy_px is None:
+        st.info("No model Buy price is available for this ticker, so the ladder starts at today's price instead.")
+        use_value = False
+    anchor = buy_px if use_value else price
+    entry = build_entry_ladder(anchor, n_tr, step, total, price)
+    st.dataframe(
+        _plan_df(entry, ("Buy at or below", "Amount"), ("Distance from today %",), ("Shares",)),
+        hide_index=True, width="stretch", height=(len(entry) + 1) * 35 + 3,
+    )
+    reached = sum(1 for r in entry if r["Status"].startswith("Reached"))
+    if reached:
+        st.success(f"{reached} of {n_tr} tranches are reached at today's price: about {_usd(total * reached / n_tr)} could be invested now.")
+    elif buy_px is not None and use_value:
+        st.info(f"Price is {(price / buy_px - 1) * 100:.1f}% above the Buy price, so no tranche is reached yet. Be patient or use the Pullback style.")
+    sup = [f"{n} {_usd(v)}" for n, v in (("lower Bollinger band", bb_low), ("200-day average", ma200), ("52-week low", lo52)) if v]
+    if sup:
+        st.caption("Support levels to compare with your triggers: " + "; ".join(sup) + ". A trigger near one of these has extra reason to hold.")
+
+    # ---------------- exit ----------------
+    st.markdown("### 2. Exit: take profit in steps")
+    holdings = st.session_state.get("pf_base")
+    d_sh, d_cost = 0.0, 0.0
+    if isinstance(holdings, pd.DataFrame) and not holdings.empty:
+        m = holdings[holdings["Symbol"].astype(str).str.upper() == active_stock]
+        if not m.empty:
+            d_sh, d_cost = float(m["Shares"].iloc[0] or 0.0), float(m["Avg cost"].iloc[0] or 0.0)
+    x1, x2, x3 = st.columns(3)
+    with x1:
+        shares = st.number_input("Shares I own", min_value=0.0, value=d_sh, step=1.0, key=f"plan_shares_{active_stock}")
+    with x2:
+        avg_cost = st.number_input("My average cost per share", min_value=0.0, value=d_cost, step=1.0, key=f"plan_cost_{active_stock}")
+    with x3:
+        bases = ["Model fair value", "My average cost"]
+        basis = st.radio("Measure steps from", bases, key="plan_basis", help="Fair value suits a valuation-driven exit. Average cost suits a pure profit target.")
+    base_px = fair_px if basis == bases[0] else (avg_cost or None)
+    if base_px is None:
+        st.info("Enter your average cost (or pick Model fair value on a stock that has one) to build the exit ladder. Holdings stay in this browser session only and are never saved.")
+    else:
+        if basis == bases[0]:
+            defaults = pd.DataFrame({"Trigger (% above fair value)": [0.0, 20.0, 40.0], "Sell (% of my shares)": [10.0, 15.0, 25.0]})
+        else:
+            defaults = pd.DataFrame({"Trigger (% above my cost)": [30.0, 60.0, 100.0], "Sell (% of my shares)": [10.0, 15.0, 25.0]})
+        edited = st.data_editor(
+            defaults, hide_index=True, num_rows="fixed", width="stretch",
+            key=f"plan_exit_{'fair' if basis == bases[0] else 'cost'}_{active_stock}",
+        )
+        levels, sells = edited.iloc[:, 0].fillna(0.0).tolist(), edited.iloc[:, 1].fillna(0.0).tolist()
+        if sum(sells) > 100.0:
+            st.warning("The sell percentages add up to more than 100%. The last steps are cut back to what is left.")
+        exit_rows = build_exit_ladder(base_px, levels, sells, price, shares, avg_cost)
+        st.dataframe(
+            _plan_df(exit_rows, ("Sell when price reaches", "Cash received", "Gain locked in"), ("Distance from today %", "Sell % of position"), ("Shares to sell",)),
+            hide_index=True, width="stretch", height=(len(exit_rows) + 1) * 35 + 3,
+        )
+        if not shares:
+            st.caption("Enter the shares you own to see share counts, cash received and gains.")
+
+    # ---- technical profit-taking read
+    sell = compute_sell_signals(download_daily(active_stock))
+    above_fair = _above_fair(val_rows)
+    t_level, t_why = trim_signal(sell["count"], above_fair, q_pct, q_n)
+    s1, s2 = st.columns(2)
+    s1.metric("Overbought signals today", "N/A" if sell["count"] is None else f"{sell['count']} of 3")
+    s2.metric("Profit-taking level", t_level, t_why, delta_color="off")
+    if t_level == "Trim":
+        st.warning("The overbought signals and the valuation both say Trim today. Many investors take the first step now rather than waiting for the next price trigger.")
+    st.caption(
+        "Overbought signals: close above the upper Bollinger band (15, 2), RSI (10) above 70, and MACD below its signal line, on daily bars."
+    )
+
+    # ---- rules to re-check
+    with st.expander("When to stop and re-check the plan", expanded=False):
+        st.markdown(
+            "- **Stop adding** and re-run the Buy checklist if the price falls below your last tranche by more than one step, "
+            "or if the Quality score drops under 50%.\n"
+            "- **Update your average cost** in My portfolio after each tranche, because every buy changes it.\n"
+            "- **Re-run the exit levels** after each earnings report: fair value moves when profit estimates change.\n"
+            "- A ladder is a plan, not a promise. If the business story changes, change the plan."
+        )
+
+    export = [{"Section": "Entry", **r} for r in entry]
+    if base_px is not None:
+        export += [{"Section": "Exit", **r} for r in exit_rows]
+    st.download_button(
+        "Download this plan (CSV)",
+        data=pd.DataFrame(export).to_csv(index=False).encode("utf-8"),
+        file_name=f"{active_stock}_entry_exit_plan.csv",
+        mime="text/csv",
+    )
+
+
 def render_compare_tab(active_stock: str, favorites: list, r_default: float):
     st.subheader("Compare stocks side by side")
     st.caption(
@@ -3000,31 +3407,37 @@ def main():
     if not options:
         options = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL"]
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    # One ticker box: pick from the list (favorites first) or type any Yahoo symbol and press Enter.
+    # Everything loads as soon as the box changes, so there is no separate "Load chart" step.
+    pending = st.session_state.pop("pending_ticker", None)
+    if pending:
+        st.session_state["ticker_box"] = str(pending).strip().upper()
+    if not st.session_state.get("ticker_box"):
+        st.session_state["ticker_box"] = options[0]
+    current_pick = str(st.session_state["ticker_box"]).strip()
+    box_options = options if current_pick in options else options + [current_pick]
+
+    col1, col2 = st.columns([2, 3])
     with col1:
-        selected_stock = st.selectbox("Select stock ticker", options=options, index=0)
+        picked = st.selectbox(
+            "Stock ticker",
+            options=box_options,
+            key="ticker_box",
+            accept_new_options=True,
+            help="Your favorites are listed first, then your stock list. Click the box and type to search. "
+                 "To look up any other stock, type its Yahoo Finance symbol (for example BRK-B) and press Enter.",
+        )
     with col2:
-        custom_stock = st.text_input("Or type custom ticker", value="").strip().upper()
-    with col3:
-        st.write("")  # align button
         st.write("")
-        load_clicked = st.button("Load chart", type="primary")
+        st.caption("Pick from the list or type any symbol and press Enter. Everything below updates right away.")
 
-    stock = custom_stock if custom_stock else selected_stock
-
-    if "active_stock" not in st.session_state:
-        st.session_state["active_stock"] = None
-
-    if load_clicked:
-        st.session_state["active_stock"] = stock
-    # Auto-load the selected ticker on first visit so the app shows content immediately
-    elif st.session_state["active_stock"] is None and stock:
-        st.session_state["active_stock"] = stock
+    stock = str(picked or "").strip().upper()
+    st.session_state["active_stock"] = stock or None
 
     active_stock = st.session_state["active_stock"]
 
     if not active_stock:
-        st.info("Select a stock and click 'Load chart' to view charts, financial metrics, and valuation.")
+        st.info("Pick or type a stock ticker above to see charts, business metrics and valuation.")
         return
 
     with st.spinner(f"Loading data for {active_stock}..."):
@@ -3058,27 +3471,39 @@ def main():
     quality = fetch_quality_metrics(active_stock)
     valctx = fetch_valuation_context(active_stock)
     trend = compute_trend_context(download_daily(active_stock), download_daily("SPY"))
+    if not fin and not quality.get("available") and get_instrument_info(active_stock)["type"] not in ETF_TYPES:
+        render_data_gap_banner(active_stock)
+    _scan_asof = load_rankings()[1].get("asof")
+    st.caption(
+        f"Data as of: prices to {pd.to_datetime(latest.name):%Y-%m-%d %H:%M} (Yahoo, refreshed about every 15 minutes); "
+        f"company statements refreshed about hourly; last daily scan: {_scan_asof or 'not run yet'}."
+    )
 
     # Default required return r = trailing 3-year S&P 500 annualized return + 2%, capped at 15% (fallback 12%)
     sp3 = sp500_trailing_return(3)
     r_default = round(min(sp3 + 2.0, 15.0), 1) if sp3 is not None else 12.0
 
     # Stock-specific starting assumptions; reset whenever the active ticker changes (r keeps any override)
-    sugg = suggest_valuation_defaults(fin, quality, valctx)
-    defaults_changed = st.session_state.get("val_defaults_for") != active_stock
+    if st.session_state.get("val_defaults_for_stock") != active_stock:
+        st.session_state["val_profile_choice"] = "Auto"
+    profile_choice = st.session_state.get("val_profile_choice", "Auto")
+    sugg = suggest_valuation_defaults(fin, quality, valctx, None if profile_choice == "Auto" else profile_choice)
+    defaults_changed = st.session_state.get("val_defaults_for") != (active_stock, profile_choice)
     for key, val in (("val_g_pct", sugg["g"]), ("val_k_multiple", sugg["k"]), ("val_mos_pct", sugg["mos"])):
         if defaults_changed or key not in st.session_state:
             st.session_state[key] = float(val)
     if "val_r_pct" not in st.session_state:
         st.session_state["val_r_pct"] = float(r_default)
-    st.session_state["val_defaults_for"] = active_stock
+    st.session_state["val_defaults_for"] = (active_stock, profile_choice)
+    st.session_state["val_defaults_for_stock"] = active_stock
 
-    tab_charts, tab_lt, tab_fin, tab_val, tab_analyst, tab_paper, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_fin, tab_val, tab_plan, tab_analyst, tab_paper, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
         [
             "Price charts",
             "Buy checklist",
             "Business snapshot",
             "Fair value",
+            "Entry and exit plan",
             "Analyst view",
             "Test the signals",
             "Compare stocks",
@@ -3240,12 +3665,23 @@ def main():
         render_business_snapshot(active_stock, current_price, fin, quality, valctx)
 
     with tab_val:
-        st.subheader(f"Valuation - {active_stock}")
+        st.subheader(f"Fair value - {active_stock}")
         st.metric("Current price (latest close)", f"${current_price:.2f}")
         if not fin or fin.get("EPS (1Y)") is None:
             st.info("Valuation inputs are not available (missing Net Income or Shares Issued data).")
         else:
             eps = fin.get("EPS (1Y)")
+            ps1, ps2 = st.columns([1, 3])
+            with ps1:
+                st.selectbox(
+                    "Stock type", ["Auto", *STOCK_TYPES], key="val_profile_choice",
+                    help="Growth, cyclical (airlines, energy, metals), financial and core stocks get different growth and multiple limits. Auto picks from the data; choose one to override.",
+                )
+            with ps2:
+                st.caption(
+                    f"Detected: {sugg['auto_profile']} ({sugg['profile_reason']}). The starting growth, multiple and margin of safety "
+                    "below follow the stock type; edit any input to override."
+                )
             st.markdown(f"**M₀ (EPS)**: **{eps:.1f}**")
             if quality.get("available"):
                 st.caption(
@@ -3442,6 +3878,9 @@ def main():
                         )
                         st.dataframe(ev_df, use_container_width=True, hide_index=True)
 
+    with tab_plan:
+        render_plan_tab(active_stock, current_price, fin, quality, trend, indicator_data, pillar_scores, r_default)
+
     with tab_analyst:
         st.subheader(f"Analyst view - {active_stock}")
         st.caption(
@@ -3458,88 +3897,112 @@ def main():
                 st.caption(f"Details: {analyst['error']}")
         else:
             av = analyst_verdict(analyst, current_price)
-            banner = {"Potential Buy": "success", "Potential Sell": "error", "Neutral": "info"}.get(av["verdict"], "warning")
-            getattr(st, banner)(
-                f"**Analyst verdict: {av['verdict']}** (score {av['total']:+d}, based on {av['n']} of 4 available signals; "
-                "+2 or more = Potential Buy, -2 or less = Potential Sell)"
-            )
-
-            tm = analyst.get("target_mean")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Yahoo consensus", analyst.get("yahoo_label") or "N/A")
-            m2.metric("Avg rating (1-5)", _fmt(analyst.get("rating_mean"), nd=2))
-            m3.metric("Analysts", "N/A" if analyst.get("num_analysts") is None else str(analyst["num_analysts"]))
-            m4.metric(
-                "Mean target",
-                "N/A" if tm is None else f"${tm:.2f}",
-                None if tm is None else f"{(tm / current_price - 1) * 100:+.1f}% vs ${current_price:.2f}",
-            )
-            lo, hi = analyst.get("target_low"), analyst.get("target_high")
-            m5.metric("Target range", "N/A" if lo is None or hi is None else f"${lo:.0f} - ${hi:.0f}")
-
-            left, right = st.columns([1, 1])
-            with left:
-                st.pyplot(plot_rating_distribution(analyst), use_container_width=True)
-            with right:
-                st.markdown("**How the verdict is built**")
-                st.dataframe(pd.DataFrame(av["rows"]), hide_index=True, use_container_width=True, height=36 * 5 + 3)
-                st.caption(
-                    f"Score = sum of the four signals ({av['total']:+d}). Needs at least 2 available signals; "
-                    "N/A signals are ignored."
-                )
-
-            st.pyplot(plot_price_targets(active_stock, current_price, analyst), use_container_width=True)
-
-            with st.expander("Earnings and revenue estimates, revisions", expanded=False):
-                if analyst.get("eps_estimate") is not None:
-                    st.markdown("**EPS estimates**")
-                    st.dataframe(_format_estimates(analyst["eps_estimate"]), use_container_width=True)
-                if analyst.get("rev_estimate") is not None:
-                    st.markdown("**Revenue estimates ($)**")
-                    st.dataframe(_format_estimates(analyst["rev_estimate"], money=True), use_container_width=True)
-                if analyst.get("eps_revisions") is not None:
-                    st.markdown("**EPS estimate revisions (number of analysts)**")
-                    rev_df = analyst["eps_revisions"].copy()
-                    rev_df.index = [{"0q": "Current quarter", "+1q": "Next quarter", "0y": "Current year", "+1y": "Next year"}.get(str(i), str(i)) for i in rev_df.index]
-                    st.dataframe(rev_df, use_container_width=True)
-                if all(analyst.get(k) is None for k in ("eps_estimate", "rev_estimate", "eps_revisions")):
-                    st.info("No estimate data available for this ticker.")
-
-            with st.expander("Recent analyst actions (latest 10)", expanded=False):
-                acts = analyst.get("actions")
-                if acts is None:
-                    st.info("No recent upgrades / downgrades available.")
-                else:
-                    a = acts.reset_index()
-                    date_col = a.columns[0]
-                    def _pt(row):
-                        cur, prior = row.get("currentPriceTarget"), row.get("priorPriceTarget")
-                        if pd.isna(cur) or cur in (0, 0.0):
-                            return "-"
-                        return f"${cur:.0f}" if pd.isna(prior) or prior in (0, 0.0) else f"${prior:.0f} -> ${cur:.0f}"
-                    disp = pd.DataFrame(
-                        {
-                            "Date": pd.to_datetime(a[date_col]).dt.strftime("%Y-%m-%d"),
-                            "Firm": a.get("Firm"),
-                            "Rating": a.get("FromGrade").fillna("").astype(str) + " -> " + a.get("ToGrade").fillna("").astype(str),
-                            "Action": a.get("Action"),
-                            "Price target": a.apply(_pt, axis=1),
-                        }
+            if av["n"] == 0:
+                try:
+                    is_fund = get_instrument_info(active_stock).get("type") in ETF_TYPES
+                except Exception:
+                    is_fund = False
+                if is_fund:
+                    st.info(
+                        "This is a fund (ETF). Wall Street analysts publish ratings, price targets and earnings estimates for "
+                        "individual companies, not for funds, so there is nothing to show here. Use Price charts and the Buy "
+                        "checklist (Timing) for funds, or open the Analyst view of one of the fund's biggest holdings."
                     )
-                    st.dataframe(disp, hide_index=True, use_container_width=True)
-
-            with st.expander("Data source status", expanded=False):
-                labels = {
-                    "info": "Company summary (info)", "price_targets": "Price targets", "ratings": "Rating counts",
-                    "actions": "Upgrades / downgrades", "eps_estimate": "EPS estimates", "rev_estimate": "Revenue estimates",
-                    "growth": "Growth estimates", "eps_trend": "EPS trend", "eps_revisions": "EPS revisions",
-                }
-                st.dataframe(
-                    pd.DataFrame([{"Source": labels.get(k, k), "Status": v} for k, v in analyst["status"].items()]),
-                    hide_index=True,
-                    use_container_width=True,
+                else:
+                    st.warning(
+                        "Yahoo returned no analyst ratings, price targets or estimates for this ticker. Small or newly listed "
+                        "companies can have none, but it can also be a temporary gap. Open the status table below and try Reload."
+                    )
+                with st.expander("Data source status", expanded=not is_fund):
+                    st.dataframe(
+                        pd.DataFrame([{"Source": k, "Status": v} for k, v in analyst["status"].items()]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    st.button("Reload analyst data", key="reload_analyst_empty", on_click=_clear_analyst_cache)
+            else:
+                banner = {"Potential Buy": "success", "Potential Sell": "error", "Neutral": "info"}.get(av["verdict"], "warning")
+                getattr(st, banner)(
+                    f"**Analyst verdict: {av['verdict']}** (score {av['total']:+d}, based on {av['n']} of 4 available signals; "
+                    "+2 or more = Potential Buy, -2 or less = Potential Sell)"
                 )
-                st.button("Reload analyst data", key="reload_analyst", on_click=_clear_analyst_cache)
+
+                tm = analyst.get("target_mean")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Yahoo consensus", analyst.get("yahoo_label") or "N/A")
+                m2.metric("Avg rating (1-5)", _fmt(analyst.get("rating_mean"), nd=2))
+                m3.metric("Analysts", "N/A" if analyst.get("num_analysts") is None else str(analyst["num_analysts"]))
+                m4.metric(
+                    "Mean target",
+                    "N/A" if tm is None else f"${tm:.2f}",
+                    None if tm is None else f"{(tm / current_price - 1) * 100:+.1f}% vs ${current_price:.2f}",
+                )
+                lo, hi = analyst.get("target_low"), analyst.get("target_high")
+                m5.metric("Target range", "N/A" if lo is None or hi is None else f"${lo:.0f} - ${hi:.0f}")
+
+                left, right = st.columns([1, 1])
+                with left:
+                    st.pyplot(plot_rating_distribution(analyst), use_container_width=True)
+                with right:
+                    st.markdown("**How the verdict is built**")
+                    st.dataframe(pd.DataFrame(av["rows"]), hide_index=True, use_container_width=True, height=36 * 5 + 3)
+                    st.caption(
+                        f"Score = sum of the four signals ({av['total']:+d}). Needs at least 2 available signals; "
+                        "N/A signals are ignored."
+                    )
+
+                st.pyplot(plot_price_targets(active_stock, current_price, analyst), use_container_width=True)
+
+                with st.expander("Earnings and revenue estimates, revisions", expanded=False):
+                    if analyst.get("eps_estimate") is not None:
+                        st.markdown("**EPS estimates**")
+                        st.dataframe(_format_estimates(analyst["eps_estimate"]), use_container_width=True)
+                    if analyst.get("rev_estimate") is not None:
+                        st.markdown("**Revenue estimates ($)**")
+                        st.dataframe(_format_estimates(analyst["rev_estimate"], money=True), use_container_width=True)
+                    if analyst.get("eps_revisions") is not None:
+                        st.markdown("**EPS estimate revisions (number of analysts)**")
+                        rev_df = analyst["eps_revisions"].copy()
+                        rev_df.index = [{"0q": "Current quarter", "+1q": "Next quarter", "0y": "Current year", "+1y": "Next year"}.get(str(i), str(i)) for i in rev_df.index]
+                        st.dataframe(rev_df, use_container_width=True)
+                    if all(analyst.get(k) is None for k in ("eps_estimate", "rev_estimate", "eps_revisions")):
+                        st.info("No estimate data available for this ticker.")
+
+                with st.expander("Recent analyst actions (latest 10)", expanded=False):
+                    acts = analyst.get("actions")
+                    if acts is None:
+                        st.info("No recent upgrades / downgrades available.")
+                    else:
+                        a = acts.reset_index()
+                        date_col = a.columns[0]
+                        def _pt(row):
+                            cur, prior = row.get("currentPriceTarget"), row.get("priorPriceTarget")
+                            if pd.isna(cur) or cur in (0, 0.0):
+                                return "-"
+                            return f"${cur:.0f}" if pd.isna(prior) or prior in (0, 0.0) else f"${prior:.0f} -> ${cur:.0f}"
+                        disp = pd.DataFrame(
+                            {
+                                "Date": pd.to_datetime(a[date_col]).dt.strftime("%Y-%m-%d"),
+                                "Firm": a.get("Firm"),
+                                "Rating": a.get("FromGrade").fillna("").astype(str) + " -> " + a.get("ToGrade").fillna("").astype(str),
+                                "Action": a.get("Action"),
+                                "Price target": a.apply(_pt, axis=1),
+                            }
+                        )
+                        st.dataframe(disp, hide_index=True, use_container_width=True)
+
+                with st.expander("Data source status", expanded=False):
+                    labels = {
+                        "info": "Company summary (info)", "price_targets": "Price targets", "ratings": "Rating counts",
+                        "actions": "Upgrades / downgrades", "eps_estimate": "EPS estimates", "rev_estimate": "Revenue estimates",
+                        "growth": "Growth estimates", "eps_trend": "EPS trend", "eps_revisions": "EPS revisions",
+                    }
+                    st.dataframe(
+                        pd.DataFrame([{"Source": labels.get(k, k), "Status": v} for k, v in analyst["status"].items()]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    st.button("Reload analyst data", key="reload_analyst", on_click=_clear_analyst_cache)
 
     with tab_fav:
         st.subheader("Favorites")
@@ -3563,7 +4026,7 @@ def main():
                     st.text(ticker)
                 with r2:
                     if st.button("Load", key=f"load_fav_{ticker}"):
-                        st.session_state["active_stock"] = ticker
+                        st.session_state["pending_ticker"] = ticker
                         st.rerun()
                 with r3:
                     if st.button("Remove", key=f"rem_fav_{ticker}"):
@@ -3585,6 +4048,7 @@ def main():
 | **Buy checklist** | Is this a good business, at a good price, at a sensible moment? | First screen for any stock; the main decision tab |
 | **Business snapshot** | How healthy and fast-growing is the business, and what stands out? | Understanding the company behind the ticker |
 | **Fair value** | What could it be worth, and what is the most I should pay? | Setting a buy price from your own assumptions |
+| **Entry and exit plan** | How do I buy in stages and take profit in stages? | Turning the buy price and fair value into a price-by-price plan |
 | **Analyst view** | What do professional analysts think, and is that changing? | A cross-check against your own view |
 | **Test the signals** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
 | **Compare stocks** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
@@ -3593,27 +4057,30 @@ def main():
 | **My favorites** | Shortcuts to the stocks I follow | Saving a search through the dropdown |
 | **How it works** | What does each number mean? | Whenever a metric is unclear (this page) |
 
-The first six tabs are about the **one stock you loaded**. The next four look **across stocks** or at your own holdings.
+The first seven tabs are about the **one stock you loaded**. The next four look **across stocks** or at your own holdings.
 
 **Suggested workflow**
-1. Pick a ticker at the top (dropdown, or type your own) and click **Load chart**.
+1. Pick a ticker in the **Stock ticker** box at the top (or type any symbol and press Enter). Everything loads right away.
 2. Open **Buy checklist**. Read the verdict and the three scores (Quality, Valuation, Timing). A failed check is a question to investigate, not an automatic no.
 3. Open **Business snapshot** to see the business's strengths and watch-outs, then **Fair value** to set your own growth, multiple and margin-of-safety assumptions. Compare the current price with the **Buy price**.
-4. Use **Price charts** to judge timing, and **Test the signals** to see whether those timing signals have actually worked for this stock.
-5. Cross-check with **Analyst view**.
-6. Use **Compare stocks** to choose between candidates, **Top 10 lists** for new ideas (and alerts on your favorites), and **My portfolio** for profit-taking signals on what you own. Keep the stocks you follow in **My favorites**.
+4. Open **Entry and exit plan** to split your money into tranches and set the prices at which you would sell part of the position.
+5. Use **Price charts** to judge timing, and **Test the signals** to see whether those timing signals have actually worked for this stock.
+6. Cross-check with **Analyst view**.
+7. Use **Compare stocks** to choose between candidates, **Top 10 lists** for new ideas (and alerts on your favorites), and **My portfolio** for profit-taking signals on what you own. Keep the stocks you follow in **My favorites**.
 
 **Ideal long-term buy:** a high-quality business (Quality), priced below your buy price (Valuation), at a moment when the trend is intact and the price has pulled back (Timing).
 """)
 
         with st.expander("Top bar and general notes (ticker, current price, data freshness)"):
             st.markdown("""
-- **Select stock ticker:** your Favorites appear first, then the stocks from your stock list.
-- **Or type custom ticker:** overrides the dropdown. Use the Yahoo Finance symbol (for example BRK-B for Berkshire).
-- **Load chart:** loads the selected ticker into every tab. Changing the dropdown or typing a ticker does nothing until you click this button. On your first visit the app loads the first ticker automatically.
+- **Stock ticker:** one box. Your Favorites appear first, then the stocks from your stock list. Click it and type to search the list.
+- **Any other stock:** type its Yahoo Finance symbol in the same box (for example BRK-B for Berkshire) and press Enter.
+- **No Load button:** choosing or typing a ticker loads it into every tab straight away. The **Load** button in My favorites fills this same box.
 - **Current price:** the latest close of the most recent 4-hour bar, so it can lag the live price slightly.
 - **Data source:** Yahoo Finance for everything. Prices refresh about every 15 minutes, company statements and valuation history about every hour, so numbers may not change on every click.
 - **Missing data:** when Yahoo has no value, the app shows N/A and ignores that item when scoring.
+- **Data as of line:** under the top bar, it shows the date of the latest price bar, how often data refreshes, and the date of the last daily scan.
+- **When Yahoo is having a bad moment:** Yahoo sometimes returns nothing (more often on shared cloud servers). The app then shows a yellow notice instead of empty tabs, with a **Try again** button and, when available, the last saved scan result for that stock. A failed lookup is never remembered: the next click asks Yahoo again (with a short pause of about two minutes between automatic retries so Yahoo is not hammered).
 - **Not investment advice.** The app organizes public data and simple rules; it cannot see the future.
 """)
 
@@ -3734,7 +4201,14 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **Return r (%):** the yearly return you demand; the rate used to bring future values back to today. Default: S&P 500 trailing 3-year annualized return plus 2%, capped at 15%, so the hurdle does not balloon after a strong market.
 - **MoS (%):** margin of safety, a cushion for being wrong. A 25% margin means you only buy at 75% of fair value.
 
-Defaults are suggested per stock: g is the median of its past revenue, EPS and FCF growth (kept between 3% and 10%; the line under the inputs shows the raw historical number and says when it was capped). The cap exists because the model compounds g for 10 years, and a fast recent streak (for example 12% or 30%) rarely lasts a decade, so using it would make a stock look cheaper than it is. If you believe a company can keep growing faster, type a higher g yourself; K is its own median P/E (between 12 and 22, capped at 15 for leveraged or cash-burning companies); MoS is 25% (15% for high-quality businesses, 35% for leveraged or negative-FCF ones). Edit any input; **Reset inputs to suggested** restores them. The caption under the inputs also shows the stock's historical growth to keep g realistic.
+**Stock type (Auto or your choice).** Companies grow and trade differently, so the app first detects a type and uses it to set the suggested g, K and MoS. The **Stock type** box on the tab shows what was detected and why; pick another type to override it (it resets to Auto when you load a new ticker). The return r is the same for every type.
+- **Core** (default): g is the median of past revenue, EPS and FCF growth kept between 3% and 10%; K is the stock's own median P/E kept between 12 and 22.
+- **Growth** (revenue growing 12% a year or more): a two-stage model. Growth starts at the historical median (kept between 10% and 25%) for 5 years, then fades in a straight line to 5% by year 10. The tab turns that into one equivalent flat g so the same formulas work. K is kept between 15 and 30. This stops fast growers from always looking expensive while still not assuming growth lasts forever.
+- **Cyclical** (energy, airlines, steel, mining, shipping, homebuilders and similar): g between 2% and 5%, K between 6 and 14, MoS 35%. Earnings of these companies swing with the economy, so peak earnings should not be capitalised at a high multiple.
+- **Financial** (banks and insurers): g between 3% and 8%, K between 8 and 14.
+- **Leveraged or cash-burning companies** of any type: K capped at 15 and MoS 35%. Otherwise MoS is 15% for high-quality businesses (Quality 80% or more) and 25% for the rest.
+
+The line under the inputs shows the raw historical growth and says when it was capped. The caps exist because the model compounds g for 10 years and a fast recent streak rarely lasts that long. If you believe a company can keep growing faster, type a higher g yourself. Edit any input; **Reset inputs to suggested** restores the suggestion.
 
 **EPS-based model (1, 5 and 10 years)**
 - **M0 (EPS):** last fiscal year earnings per share, the starting point.
@@ -3755,6 +4229,29 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 - **Status:** **Buy zone** (price at or below Buy price), **Between buy price and fair value**, or **Above fair value**.
 
 **Sensitivity grid:** the 10-year Buy price for several growth rates (rows) and terminal multiples (columns), for the model you choose. **Green** cells mean today's price is at or below that buy price; **red** means above. If most of the grid is red, the stock needs optimistic assumptions to look cheap.
+""")
+
+        with st.expander("Entry and exit plan tab: buy in stages, sell in stages"):
+            st.markdown("""
+**What it helps you do:** turn the buy price and fair value from the Fair value tab into a price-by-price plan, so you decide in advance how to buy and how to take profit instead of deciding in the heat of the moment.
+
+**Top of the tab:** a verdict banner and six reference prices: current price, the model **Buy price**, **Fair value**, the lower Bollinger band (4-hour), the 200-day average and the 52-week low. A warning appears when Quality is below 50%, because staged buying of a weak business only averages down into a problem.
+
+**Entry ladder (buying in stages)**
+- **Total to invest** is split evenly into **tranches** (2 to 6).
+- **Ladder style:** **Value** starts at the model Buy price and steps down from there; **Pullback** starts at today's price. **Step %** is the gap between tranches.
+- The table shows each tranche's price, amount, shares and whether the price has been reached ("Reached: buy now" or "Waiting"). If the stock has no model buy price (ETFs, or negative earnings), only the Pullback style is available.
+
+**Exit ladder (selling in stages)**
+- The ladder starts from the model **Fair value**, or from your **average cost** when you enter your position on the My portfolio tab (the browser session only; nothing is stored).
+- Defaults sell 10%, 15% and 25% of the position at 0%, 20% and 40% above fair value (30%, 60% and 100% above cost when based on cost). Edit the table to suit you; if the percentages add up to more than 100% the last steps are cut back.
+- When you have shares and a cost, the table shows shares to sell, cash received and the gain locked in at each step.
+
+**Overbought signals and trim level:** the same three overbought signals and Trim / Review / Watch / Hold level used on the My portfolio tab.
+
+**When to stop and re-check** lists the situations in which the plan should be reviewed (for example a drop in Quality or a broken business story) rather than followed mechanically. A CSV download saves the plan.
+
+This is a planning aid built on your own assumptions. It is not investment advice.
 """)
 
         with st.expander("Test the signals tab: how the timing rules would have done"):
@@ -3797,6 +4294,7 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 - **Price target chart:** the analyst range with the mean, median and the current price marked.
 - **Estimates expander:** EPS and revenue forecasts for the current and next quarter and year, plus how many analysts raised or cut their EPS estimates.
 - **Recent analyst actions:** the latest upgrades, downgrades and target changes by firm.
+- **Funds (ETFs):** analysts do not cover funds, so the tab shows a short explanation instead of empty numbers.
 - **Data source status:** which Yahoo lookups worked. Each source is fetched separately, so one failure does not blank the tab. If everything fails (usually a temporary Yahoo limit) a message and a **Retry** button appear, and failures are never cached.
 
 **How the verdict is calculated.** Four signals each score +1 (bullish), 0 (neutral) or -1 (bearish):
@@ -3842,11 +4340,13 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 
 **Columns:** Q / V / T is the Quality, Valuation and Timing score in percent. **Upside to fair** is the average gap between fair value and the price across the available models (negative means the price is above fair value). **Overbought** is how many of the 3 profit-taking signals are on. A star marks your Favorites and **NEW** marks stocks that entered the list in the latest scan.
 
+**Buy-price watch:** your Favorites with Quality of 50% or more, showing how far the price is from the model Buy price (10-year EPS model). **In zone** means the price is at or below the Buy price; **Near** means within 5% above it. The gap is (price / Buy price - 1) in percent, so a negative gap means below the Buy price. The list also shows the stock type used for the valuation.
+
 **Profit-taking watch:** your Favorites with a Trim, Review or Watch signal (rules under the My portfolio tab).
 
-**Alerts:** the same daily scan opens a GitHub issue, which GitHub emails to you, when one of your Favorites newly enters the top 10 buy list or the top 10 avoid list, or newly reaches the Trim level.
+**Alerts:** the same daily scan opens a GitHub issue, which GitHub emails to you, when one of your Favorites newly enters the top 10 buy list or the top 10 avoid list, newly reaches the Trim level, or newly drops to **your buy price** (the Buy-price watch "In zone" status). Only changes against the previous scan count, so you are not alerted every day for the same stock. The very first scan after this feature is added counts everything as new and sends one baseline alert.
 
-**Limits:** results depend on the default growth, multiple and margin of safety for each stock. Fast growers tend to look expensive because those defaults are capped. Treat the lists as a place to start research.
+**Limits:** results depend on the default growth, multiple and margin of safety for each stock. The stock type (Core, Growth, Cyclical, Financial) changes the defaults, and cyclicals are deliberately held to a stricter standard. Treat the lists as a place to start research.
 """)
 
         with st.expander("My portfolio tab: your positions and profit-taking signals"):
