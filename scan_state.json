@@ -1,0 +1,56 @@
+{
+  "asof": "2026-11-03 20:25 UTC",
+  "universe": 538,
+  "scored": 519,
+  "r_default": 15.0,
+  "top_buy": [
+    "DECK",
+    "ADBE",
+    "MELI",
+    "LULU",
+    "PDD",
+    "CAH",
+    "TSM",
+    "BKNG",
+    "INTU",
+    "TTD"
+  ],
+  "top_avoid": [
+    "EL",
+    "BAX",
+    "TTWO",
+    "CRWD",
+    "ZS",
+    "EVRG",
+    "DD",
+    "AEE",
+    "ED",
+    "SNPS"
+  ],
+  "trim": [],
+  "new_buy": [
+    "DECK",
+    "ADBE",
+    "MELI",
+    "LULU",
+    "PDD",
+    "CAH",
+    "TSM",
+    "BKNG",
+    "INTU",
+    "TTD"
+  ],
+  "new_avoid": [
+    "EL",
+    "BAX",
+    "TTWO",
+    "CRWD",
+    "ZS",
+    "EVRG",
+    "DD",
+    "AEE",
+    "ED",
+    "SNPS"
+  ],
+  "new_trim": []
+}
