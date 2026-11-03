@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -94,13 +95,16 @@ def download_data(stock: str) -> pd.DataFrame:
 @st.cache_data(ttl=900, show_spinner=False)
 def download_data_for_paper(stock: str, years: int) -> pd.DataFrame:
     """Download 1h data for paper trading; Yahoo 1h allows up to ~730 days."""
-    period_days = min(730, max(30, int(years * 365)))
-    period = f"{period_days}d"
+    # Explicit dates (not period=) because yfinance mishandles period= for recently listed stocks such as RDDT.
+    period_days = min(700, max(30, int(years * 365)))
+    start_date = (datetime.now() - timedelta(days=period_days)).strftime("%Y-%m-%d")
+    end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     for attempt in range(MAX_RETRIES + 1):
         try:
             data = yf.download(
                 stock,
-                period=period,
+                start=start_date,
+                end=end_date,
                 interval="1h",
                 progress=False,
                 auto_adjust=False,
@@ -144,6 +148,22 @@ def calculate_indicators(raw_data: pd.DataFrame, stock: str) -> pd.DataFrame:
     data_4h["MACD_Signal"] = macd_indicator.macd_signal()
 
     return data_4h.dropna()
+
+
+def calculate_indicators_daily(raw_data: pd.DataFrame) -> pd.DataFrame:
+    """Daily bars with Bollinger (20, 2), RSI (10) and MACD (8/21/5). Used by the paper test for periods longer than
+    Yahoo's 2-year hourly-data limit."""
+    data = normalize_ohlcv_columns(raw_data)
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+    data = data.dropna()
+    bb = BollingerBands(close=data["Close"], window=20, window_dev=2)
+    data["BB_High"] = bb.bollinger_hband()
+    data["BB_Low"] = bb.bollinger_lband()
+    data["RSI"] = RSIIndicator(data["Close"], window=10).rsi()
+    macd = MACD(data["Close"], window_slow=21, window_fast=8, window_sign=5)
+    data["MACD"] = macd.macd()
+    data["MACD_Signal"] = macd.macd_signal()
+    return data.dropna()
 
 
 def calculate_reversal_confidence(raw_data: pd.DataFrame, stock: str) -> dict:
@@ -223,12 +243,17 @@ def run_paper_simulation(
     df_4h: pd.DataFrame,
     money_invested: float,
     pct_taken_out: float,
+    lookback: int = 1,
 ) -> dict:
     """
-    Simulate paper trading on 4h bars.
-    Buy: Close < BB_Low, RSI < 30, MACD crosses above Signal.
-    Sell: Close > BB_High, RSI > 70, MACD crosses below Signal; sell pct_taken_out of position.
+    Simulate paper trading on bars that already carry BB / RSI / MACD columns (4h or daily).
+    Buy: MACD crosses above Signal on this bar, and (Close < BB_Low and RSI < 30) on this bar or any of the previous
+    lookback - 1 bars. lookback = 1 is the strict rule: all three on the same bar.
+    Sell: the mirror image (Close > BB_High and RSI > 70, MACD crosses below Signal); sell pct_taken_out of position.
     """
+    lb = max(1, int(lookback))
+    oversold = ((df_4h["Close"] < df_4h["BB_Low"]) & (df_4h["RSI"] < 30)).astype(int).rolling(lb, min_periods=1).max().astype(bool).to_numpy()
+    overbought = ((df_4h["Close"] > df_4h["BB_High"]) & (df_4h["RSI"] > 70)).astype(int).rolling(lb, min_periods=1).max().astype(bool).to_numpy()
     total_invested = 0.0
     shares = 0.0
     cost_basis = 0.0
@@ -241,10 +266,9 @@ def run_paper_simulation(
         prev = df_4h.iloc[i - 1]
         close = float(row["Close"])
 
-        # Buy: below BB low, RSI < 30, MACD just crossed above Signal
+        # Buy: oversold (below BB low and RSI < 30) now or within the window, MACD just crossed above Signal
         buy_signal = (
-            close < row["BB_Low"]
-            and row["RSI"] < 30
+            bool(oversold[i])
             and row["MACD"] > row["MACD_Signal"]
             and prev["MACD"] <= prev["MACD_Signal"]
         )
@@ -258,8 +282,7 @@ def run_paper_simulation(
         # Sell: above BB high, RSI > 70, MACD just crossed below Signal; sell pct_taken_out of shares
         sell_signal = (
             shares > 0
-            and close > row["BB_High"]
-            and row["RSI"] > 70
+            and bool(overbought[i])
             and row["MACD"] < row["MACD_Signal"]
             and prev["MACD"] >= prev["MACD_Signal"]
         )
@@ -2948,39 +2971,60 @@ def main():
     with tab_paper:
         st.subheader(f"Paper investing check – {active_stock}")
         st.caption(
-            "Simulates: buy when price below BB lower band, RSI < 30, and MACD crosses above Signal; "
-            "sell the chosen % when price above BB upper band, RSI > 70, and MACD crosses below Signal. "
-            "Uses 4-hour bars over the selected period."
+            "Simulates: buy when price is below the lower Bollinger Band with RSI under 30 and MACD crosses above its "
+            "Signal line; sell the chosen % when price is above the upper band with RSI over 70 and MACD crosses below its "
+            "Signal. The signal window lets the band and RSI condition have happened in the last few bars (1 = all on the same bar)."
         )
-        p1, p2, p3 = st.columns(3)
+        p0, p1, p2, p3, p4 = st.columns(5)
+        with p0:
+            paper_bar = st.selectbox("Bar size", ["4-hour (up to 2 years)", "Daily (up to 10 years)"], key="paper_bar")
+        daily_mode = paper_bar.startswith("Daily")
+        max_years = 10 if daily_mode else 2
+        if st.session_state.get("paper_years", 2) > max_years:
+            st.session_state["paper_years"] = max_years
         with p1:
-            paper_years = st.number_input("Number of years", value=2, min_value=1, max_value=2, step=1, key="paper_years")
+            paper_years = st.number_input("Number of years", value=2, min_value=1, max_value=max_years, step=1, key="paper_years")
         with p2:
             paper_money = st.number_input("Money invested per buy ($)", value=1000.0, min_value=1.0, step=100.0, key="paper_money")
         with p3:
             paper_pct = st.number_input("Money taken out (%)", value=10.0, min_value=1.0, max_value=100.0, step=1.0, key="paper_pct")
+        with p4:
+            paper_window = st.number_input(
+                "Signal window (bars)", value=5, min_value=1, max_value=20, step=1, key="paper_window",
+                help="1 = band, RSI and MACD all on the same bar (very strict). 5 = the oversold or overbought condition may have happened in the last 5 bars.",
+            )
         pct_decimal = paper_pct / 100.0
 
-        with st.spinner(f"Loading {paper_years} year(s) of 4h data for {active_stock}..."):
-            raw_paper = download_data_for_paper(active_stock, paper_years)
-        if raw_paper.empty:
-            st.warning("No historical data for this period. Yahoo 1h data is limited to about 2 years.")
+        bar_label = "daily" if daily_mode else "4h"
+        with st.spinner(f"Loading {paper_years} year(s) of {bar_label} data for {active_stock}..."):
+            if daily_mode:
+                raw_paper = download_daily(active_stock, int(paper_years))
+            else:
+                raw_paper = download_data_for_paper(active_stock, paper_years)
+        if raw_paper is None or raw_paper.empty:
+            st.warning("No historical data for this period. Yahoo hourly data is limited to about 2 years; choose Daily bars for longer tests.")
         else:
             try:
-                paper_4h = calculate_indicators(raw_paper, active_stock)
+                paper_4h = calculate_indicators_daily(raw_paper) if daily_mode else calculate_indicators(raw_paper, active_stock)
             except Exception as exc:
                 st.error(f"Could not compute indicators: {exc}")
                 paper_4h = pd.DataFrame()
             if paper_4h.empty or len(paper_4h) < 2:
-                st.warning("Not enough 4h bars after computing indicators (need 200+ for BB).")
+                st.warning(f"Not enough {bar_label} bars after computing indicators.")
             else:
-                res = run_paper_simulation(paper_4h, paper_money, pct_decimal)
+                res = run_paper_simulation(paper_4h, paper_money, pct_decimal, int(paper_window))
                 st.metric("Current price (latest close)", f"${current_price:.2f}")
-                m1, m2, m3, m4 = st.columns(4)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Realized gain", f"${res['realized_gain']:,.2f}")
                 m2.metric("Unrealized gain", f"${res['unrealized_gain']:,.2f}")
                 m3.metric("Rate of return", f"{res['rate_of_return_pct']:.1f}%")
                 m4.metric("Total invested", f"${res['total_invested']:,.2f}")
+                buy_hold = (float(paper_4h["Close"].iloc[-1]) / float(paper_4h["Close"].iloc[0]) - 1.0) * 100.0
+                m5.metric("Buy and hold, same period", f"{buy_hold:+.1f}%")
+                st.caption(
+                    f"Tested {len(paper_4h):,} {bar_label} bars from {paper_4h.index[0].date()} to {paper_4h.index[-1].date()} "
+                    f"with a signal window of {int(paper_window)} bar(s)."
+                )
                 st.caption(
                     f"Final wealth: ${res['final_wealth']:,.2f} "
                     f"(cash from sales: ${res['cash_from_sales']:,.2f}, "
@@ -3315,21 +3359,25 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 **What it helps you do:** see how the app's own technical buy and sell rules would have performed on this stock over the last 1-2 years, before you rely on them.
 
 **Inputs**
-- **Number of years:** 1 or 2 (Yahoo only provides about 2 years of hourly data).
+- **Bar size:** **4-hour** bars (built from hourly data, which Yahoo limits to about 2 years) or **Daily** bars (up to 10 years). Daily mode uses Bollinger (20 days, 2 standard deviations), RSI (10) and MACD (8/21/5).
+- **Number of years:** 1 or 2 for 4-hour bars, 1 to 10 for daily bars.
+- **Signal window (bars):** how many recent bars the oversold or overbought condition may have occurred in. 1 is the strict original rule (everything on the same bar); the default 5 allows the condition within the last 5 bars.
 - **Money invested per buy:** the amount added on every buy signal (default 1,000 dollars).
 - **Money taken out (%):** the share of your current position sold on every sell signal (default 10%).
 
-**Rules (4-hour bars)**
-- **Buy** when the close is below the lower Bollinger Band, RSI is under 30, **and** MACD has just crossed above its Signal line.
-- **Sell** when the close is above the upper Bollinger Band, RSI is over 70, **and** MACD has just crossed below its Signal line (only if you hold shares).
+**Rules**
+- **Buy** when MACD has just crossed above its Signal line, **and** within the signal window the close was below the lower Bollinger Band with RSI under 30. In plain words: it was oversold recently and momentum has just turned up.
+- **Sell** when MACD has just crossed below its Signal line, **and** within the window the close was above the upper Bollinger Band with RSI over 70 (only if you hold shares).
+- With a window of 1, all three conditions must happen on the same bar. That is so rare that many stocks show no trades at all, because by the time MACD turns up, the price has usually already moved back above the lower band.
 
 **Results**
 - **Realized gain:** profit locked in by sales (sale proceeds minus the cost of the shares sold).
 - **Unrealized gain:** profit or loss on shares you still hold, at the latest price.
 - **Rate of return:** (final wealth - total invested) / total invested. Final wealth is cash from sales plus the value of shares still held.
 - **Total invested:** the sum of all buys. **Buy / sell events** lists every trade.
+- **Buy and hold, same period:** the return from simply owning the stock from the first to the last bar tested. Compare it with the Rate of return: if the signals do not beat it, they added little.
 
-**Read it with care:** the strict rules fire only occasionally, so a few trades prove little. The test ignores fees, and it does not compare with simply buying and holding. Past results do not predict future ones. The first indicator values need about 200 bars, so the earliest weeks of data produce no signals.
+**Read it with care:** even with the window, the rules fire only a few times, so a handful of trades proves little. The test ignores fees and taxes, and the rate of return is measured on the money you put in over time, so it is not directly comparable with buy and hold. Past results do not predict future ones. The 4-hour indicators need about 200 bars before the first signal.
 """)
 
         with st.expander("Analyst view tab: what professional analysts think"):
