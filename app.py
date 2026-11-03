@@ -599,7 +599,7 @@ def _format_estimates(df: pd.DataFrame, money: bool = False) -> pd.DataFrame:
             out[c] = out[c].map(lambda x: "N/A" if pd.isna(x) else f"{int(x)}")
         else:
             out[c] = out[c].map(
-                lambda x: "N/A" if pd.isna(x) else (f"{x / 1e9:.2f}B" if money and abs(x) >= 1e6 else f"{x:.2f}")
+                lambda x: "N/A" if pd.isna(x) else (str(x) if not pd.api.types.is_number(x) else (f"{x / 1e9:.2f}B" if money and abs(x) >= 1e6 else f"{x:.2f}"))
             )
     return out.rename(columns={"avg": "Average", "low": "Low", "high": "High", "yearAgoEps": "Year ago EPS",
                                "yearAgoRevenue": "Year ago revenue", "numberOfAnalysts": "# analysts", "growth": "Growth"})
