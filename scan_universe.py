@@ -3,7 +3,7 @@
 Scores every symbol in Favorites.csv + stockList.csv with the same long-term checklist the app uses,
 ranks the top 10 buy and top 10 avoid names, and writes:
 
-  rankings.csv     one row per symbol (read by the Rankings tab)
+  rankings.csv     one row per symbol (read by the Top 10 lists tab)
   scan_state.json  the current lists plus which names are NEW since the previous scan
   alert.md         only when one of your FAVORITES newly entered the top 10 buy list, the top 10
   alert_title.txt  avoid list, or newly reached the Trim level (the GitHub workflow turns it into an issue)
@@ -168,7 +168,7 @@ def main() -> int:
                 r = by_sym.loc[s]
                 parts.append(f"- **{s}**: {r['trim_reason']}; price {r['price']:.2f}")
             parts.append("")
-        parts.append("Open the Rankings and Portfolio tabs for detail. Screening aid only, not investment advice.")
+        parts.append("Open the Top 10 lists and My portfolio tabs for detail. Screening aid only, not investment advice.")
         alert_md.write_text("\n".join(parts), encoding="utf-8")
         bits = []
         if a_buy:

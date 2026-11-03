@@ -1067,12 +1067,22 @@ def fetch_quality_metrics(stock: str) -> dict:
     eps_up, eps_n = _up_years(eps_s)
     rev_up, rev_n = _up_years(revenue)
 
+    shares_s = _get_row(bs, ["Share Issued", "Ordinary Shares Number"])
+    series = pd.DataFrame(
+        {
+            "Revenue": rev_y / 1e9,
+            "Net income": ni_y / 1e9,
+            "Free cash flow": fcf_y / 1e9,
+            "Shares (billions)": _by_year(shares_s) / 1e9,
+        }
+).sort_index().dropna(how="all")
     roe = _safe_float(info.get("returnOnEquity"))
     roa = _safe_float(info.get("returnOnAssets"))
     out.update(
         {
             "available": True,
             "table": table,
+            "series": series,
             "roic": roic,
             "roe": roe * 100.0 if roe is not None else None,
             "roa": roa * 100.0 if roa is not None else None,
@@ -1693,7 +1703,7 @@ def _short_verdict(headline: str) -> str:
 
 def score_symbol(stock: str, r_default: float, bench=None) -> dict:
     """Run the full long-term checklist for one symbol with its suggested valuation defaults.
-    Returns one flat row (used by the Rankings tab, the Portfolio tab and the daily scan)."""
+    Returns one flat row (used by the Top 10 lists tab, the My portfolio tab and the daily scan)."""
     row = {
         "symbol": stock, "name": "", "type": "UNKNOWN", "sector": "", "price": None, "price_date": "",
         "verdict": "", "verdict_short": "", "quality_pct": None, "quality_n": 0, "valuation_pct": None,
@@ -1867,7 +1877,7 @@ def _rank_view(df: pd.DataFrame, favs: set, new_syms: set) -> pd.DataFrame:
 
 
 def render_rankings_tab(favorites: list, r_default: float):
-    st.subheader("Rankings: top 10 buy and top 10 avoid")
+    st.subheader("Top 10 lists: best to buy and most to avoid")
     file_df, state = load_rankings()
     live_df = st.session_state.get("live_rankings")
     favs = set(favorites)
@@ -1975,7 +1985,7 @@ def render_rankings_tab(favorites: list, r_default: float):
             st.session_state.pop("live_rankings", None)
             st.rerun()
     st.caption(
-        "How the lists are built: see the Explanation tab. Rankings are a screening aid, not advice, and depend on the "
+        "How the lists are built: see the How it works tab. These lists are a screening aid, not advice, and depend on the "
         "default valuation assumptions for each stock."
     )
 
@@ -2125,7 +2135,7 @@ def render_portfolio_tab(r_default: float):
         if not big.empty:
             st.warning("Concentration: " + ", ".join(f"{r['Sector']} is {r['Weight %']:.0f}% of the portfolio" for _, r in big.iterrows()) + " (over 35%).")
     st.caption(
-        "Signals use the same rules as the Rankings tab. Trim = 3 of 3 overbought signals and price above fair value; "
+        "Signals use the same rules as the Top 10 lists tab. Trim = 3 of 3 overbought signals and price above fair value; "
         "Review = Quality score under 50%; Watch = 2 overbought signals, or price above fair value with 1. "
         "Taxes and your own plan matter: this is a prompt to think, not an instruction to sell."
     )
@@ -2190,7 +2200,7 @@ def _fmt_big(x) -> str:
 
 
 def _cmp_values(row: dict, fin: dict, q: dict, v: dict, tr: dict) -> dict:
-    """Flat metric dict for the Compare table."""
+    """Flat metric dict for the Compare stocks table."""
     nd, eb = q.get("net_debt"), q.get("ebitda")
     nd_ebitda = (nd / eb) if (nd is not None and eb is not None and eb > 0) else None
     mcap, fcf1 = fin.get("Market Cap"), fin.get("FCF (1Y)")
@@ -2210,6 +2220,421 @@ def _cmp_values(row: dict, fin: dict, q: dict, v: dict, tr: dict) -> dict:
         }
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Business snapshot tab (formerly "Business snapshot")
+# ---------------------------------------------------------------------------
+
+_SIGNAL_COLORS = {
+    "Strong": "#2ea043", "Cheap": "#2ea043",
+    "OK": "#d29922", "Fair": "#d29922",
+    "Watch": "#f85149", "Pricey": "#f85149",
+}
+
+
+def _sig_style(val) -> str:
+    colour = _SIGNAL_COLORS.get(str(val))
+    return f"color: {colour}; font-weight: 600;" if colour else "color: #8b949e;"
+
+
+def _money_short(x) -> str:
+    if x is None or pd.isna(x):
+        return "N/A"
+    a, sign = abs(float(x)), ("-" if x < 0 else "")
+    if a >= 1e12:
+        return f"{sign}${a / 1e12:.2f}T"
+    if a >= 1e9:
+        return f"{sign}${a / 1e9:.1f}B"
+    if a >= 1e6:
+        return f"{sign}${a / 1e6:.0f}M"
+    return f"{sign}${a:,.0f}"
+
+
+def _tier(v, strong, ok, higher: bool = True) -> str:
+    """Strong / OK / Watch for a number against two cut-offs ('' when there is no number)."""
+    if v is None or pd.isna(v):
+        return ""
+    if higher:
+        return "Strong" if v >= strong else ("OK" if v >= ok else "Watch")
+    return "Strong" if v <= strong else ("OK" if v <= ok else "Watch")
+
+
+def _ordinal(n: float) -> str:
+    n = int(round(n))
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _pct_txt(v, nd: int = 1) -> str:
+    return "N/A" if v is None or pd.isna(v) else f"{v:.{nd}f}%"
+
+
+def _latest_and_change(s: pd.Series, unit: str = " pts"):
+    s = s.dropna() if s is not None else pd.Series(dtype=float)
+    if s.empty:
+        return None, ""
+    latest = float(s.iloc[-1])
+    if len(s) < 2:
+        return latest, ""
+    return latest, f"{latest - float(s.iloc[0]):+.1f}{unit} since {s.index[0]}"
+
+
+def snapshot_sections(price: float, fin: dict, q: dict, v: dict) -> list:
+    """Detail rows for the Business snapshot tab: [(section title, [row dicts])]."""
+    fin, q, v = fin or {}, q or {}, v or {}
+    bank = is_financial(fin)
+    table = q.get("table") if isinstance(q.get("table"), pd.DataFrame) else pd.DataFrame()
+    series = q.get("series") if isinstance(q.get("series"), pd.DataFrame) else pd.DataFrame()
+    na_bank = "N/A (financial company)"
+
+    def col(name):
+        return table[name] if name in table.columns else pd.Series(dtype=float)
+
+    def row(metric, latest, detail="", signal="", good=""):
+        return {"Metric": metric, "Latest": latest, "Trend / detail": detail, "Signal": signal, "What good looks like": good}
+
+    # ---- Profitability
+    gm, gm_chg = _latest_and_change(col("Gross margin %"))
+    om, om_chg = _latest_and_change(col("Operating margin %"))
+    nm, nm_chg = _latest_and_change(col("Net margin %"))
+    fm, fm_chg = _latest_and_change(col("FCF margin %"))
+    omc = q.get("op_margin_change")
+    fm_s = col("FCF margin %").dropna()
+    fm_drop = float(fm_s.iloc[-1] - fm_s.iloc[0]) if len(fm_s) >= 2 else None
+    roic, roe = q.get("roic"), q.get("roe")
+    profit = [
+        row("Gross margin", _pct_txt(gm), gm_chg, "", "Higher is better; steady or rising is the goal"),
+        row("Operating margin", _pct_txt(om), om_chg,
+            "" if omc is None else ("Strong" if omc >= 2 else ("OK" if omc >= -2 else "Watch")),
+            "Not shrinking by more than 2 points"),
+        row("Net margin", _pct_txt(nm), nm_chg, "", "Profit kept from each dollar of sales"),
+    ]
+    if bank:
+        profit.append(row("Free-cash-flow margin", na_bank, "", "", ""))
+    else:
+        profit.append(row("Free-cash-flow margin", _pct_txt(fm), fm_chg,
+                          "" if fm_drop is None else ("Watch" if fm_drop <= -5 else "OK"),
+                          "Cash left after investing, as a share of sales; a drop of 5 points or more is a flag"))
+    profit.append(row("Return on invested capital (ROIC)", na_bank if bank else _pct_txt(roic), "",
+                      "" if bank else _tier(roic, 15, 10), "Strong 15% or more; OK 10% or more"))
+    profit.append(row("Return on equity (ROE)", _pct_txt(roe), "", _tier(roe, 15, 10), "Strong 15% or more; OK 10% or more"))
+
+    # ---- Growth
+    ry = q.get("rev_years") or 0
+    span = f"over {ry:.1f} years" if ry else ""
+
+    def g_row(name, val):
+        return row(name, _pct_txt(val), span if val is not None else "", _tier(val, 10, 5), "Strong 10% a year or more; OK 5% or more")
+
+    eps_n, eps_up = q.get("eps_n") or 0, q.get("eps_up")
+    eps_sig = "" if (not eps_n or eps_up is None) else ("Strong" if eps_up == eps_n else ("OK" if eps_up / eps_n >= 0.6 else "Watch"))
+    rev2, pg = fin.get("Revenue Growth (2Y %)"), fin.get("Profit Growth (2Y vs Today)")
+    growth = [
+        g_row("Revenue growth per year", q.get("rev_cagr")),
+        g_row("Net income growth per year", q.get("ni_cagr")),
+        g_row("Earnings per share growth per year", q.get("eps_cagr")),
+        g_row("Free cash flow growth per year", None if bank else q.get("fcf_cagr")),
+        row("Years earnings per share rose", f"{eps_up} of {eps_n}" if eps_n else "N/A", "", eps_sig, "At least 60% of years"),
+        row("Revenue, total change over 2 years", "N/A" if rev2 is None else f"{rev2:+.1f}%", "Total over two years, not per year", "", ""),
+        row("Net income vs 2 years ago", pg or "N/A", "", {"Up": "Strong", "Flat": "OK", "Down": "Watch"}.get(pg, ""), "Up"),
+    ]
+
+    # ---- Cash and balance sheet
+    fcf1 = fin.get("FCF (1Y)")
+    ni_s = series["Net income"].dropna() if "Net income" in series.columns else pd.Series(dtype=float)
+    ni_latest = float(ni_s.iloc[-1]) * 1e9 if not ni_s.empty else None
+    fcf_conv = (fcf1 / ni_latest * 100.0) if (fcf1 is not None and ni_latest and ni_latest > 0) else None
+    nd, eb, nde = q.get("net_debt"), q.get("ebitda"), q.get("net_debt_ebitda")
+    fcf_pos, fcf_n = q.get("fcf_pos"), q.get("fcf_n")
+    if bank:
+        cash = [row("Debt, cash flow and coverage", na_bank, "Not meaningful for banks and insurers", "", "")]
+    else:
+        if nd is None:
+            nd_text = "N/A"
+        elif nd <= 0:
+            nd_text = "Net cash " + _money_short(abs(nd))
+        else:
+            nd_text = _money_short(nd)
+        if nd is not None and nd <= 0:
+            lev_text, lev_sig = "Net cash", "Strong"
+        elif nde is not None:
+            lev_text, lev_sig = f"{nde:.1f}x", _tier(nde, 1.5, 3.0, higher=False)
+        elif nd is not None and eb is not None and eb <= 0:
+            lev_text, lev_sig = "EBITDA is zero or negative", "Watch"
+        else:
+            lev_text, lev_sig = "N/A", ""
+        cov, cur = q.get("interest_coverage"), q.get("current_ratio")
+        cash = [
+            row("Free cash flow (latest year)", _money_short(fcf1),
+                f"positive in {fcf_pos} of {fcf_n} years" if fcf_n else "",
+                "" if (not fcf_n or fcf_pos is None) else ("Strong" if fcf_pos == fcf_n else "Watch"), "Positive every year"),
+            row("Free cash flow as % of net income", _pct_txt(fcf_conv, 0), "", _tier(fcf_conv, 90, 70), "Strong 90% or more; OK 70% or more"),
+            row("Net debt (debt minus cash)", nd_text, "", "Strong" if (nd is not None and nd <= 0) else "", "Negative means more cash than debt"),
+            row("Net debt / EBITDA", lev_text, "", lev_sig, "Strong 1.5x or less; OK 3x or less"),
+            row("Interest coverage", "N/A" if cov is None else f"{cov:.1f}x", "", _tier(cov, 10, 5), "Strong 10x or more; OK 5x or more"),
+            row("Current ratio", "N/A" if cur is None else f"{cur:.2f}", "", _tier(cur, 1.5, 1.0), "Strong 1.5 or more; OK 1.0 or more"),
+        ]
+
+    # ---- Shareholders
+    sh = fin.get("Shares Outstanding (2Y)")
+    sh_sig = "" if not sh else ("Strong" if str(sh).startswith("Buying") else ("Watch" if str(sh).startswith("Issuing") else "OK"))
+    rate = fin.get("Div Rate (FWD)")
+    if rate:
+        div_text = f"${rate:.2f} a year" + (f" ({rate / price * 100:.1f}% yield)" if price else "")
+    else:
+        div_text = "No dividend"
+    sbc = q.get("sbc_pct_fcf")
+    holders = [
+        row("Share count change (2Y)", sh or "N/A", "", sh_sig, "Buying back helps you; issuing new shares dilutes you"),
+        row("Stock compensation as % of free cash flow", na_bank if bank else _pct_txt(sbc, 0), "",
+            "" if bank else _tier(sbc, 10, 20, higher=False), "Strong 10% or less; OK 20% or less"),
+        row("Dividend", div_text, "", "", "Cash paid out to shareholders"),
+    ]
+
+    # ---- Valuation multiples
+    pe1, pe3 = fin.get("P/E (1Y)"), fin.get("P/E (3Y Avg)")
+    fwd, peg, evx = v.get("forward_pe"), v.get("peg"), v.get("ev_ebitda")
+    pct, mcap, sector_pe = v.get("pe_percentile"), fin.get("Market Cap"), fin.get("Sector PE")
+    fcf_yield = (fcf1 / mcap * 100.0) if (not bank and mcap and fcf1 is not None and mcap > 0) else None
+    if pe1 is not None and pe1 > 0 and sector_pe:
+        sec_sig = "Cheap" if pe1 <= sector_pe * 0.9 else ("Pricey" if pe1 >= sector_pe * 1.2 else "Fair")
+    else:
+        sec_sig = ""
+    fwd_sig = "" if (fwd is None or pe1 is None or pe1 <= 0) else ("Strong" if fwd < pe1 else "Watch")
+    multiples = [
+        row("P/E, latest year", "N/A" if pe1 is None else f"{pe1:.1f}", "" if pe3 is None else f"3-year average {pe3:.1f}", "",
+            "Price relative to last year's profit; lower is cheaper"),
+        row("P/E versus its own history",
+            "N/A" if pct is None else f"{v['pe_current']:.1f} (median {v['pe_median']:.1f})",
+            "" if pct is None else f"{_ordinal(pct)} percentile over {v['pe_years']:.1f} years",
+            "" if pct is None else ("Cheap" if pct <= 40 else ("Fair" if pct <= 70 else "Pricey")),
+            "40th percentile or lower is cheap"),
+        row("Forward P/E", "N/A" if fwd is None else f"{fwd:.1f}", "" if pe1 is None else f"latest-year P/E {pe1:.1f}", fwd_sig,
+            "Below the latest-year P/E means analysts expect profits to grow"),
+        row("PEG ratio", "N/A" if peg is None else f"{peg:.2f}", "",
+            "" if peg is None else ("Cheap" if peg <= 1 else ("Fair" if peg <= 2 else "Pricey")), "1 or less is cheap; 2 or less is fair"),
+        row("EV / EBITDA", "N/A" if evx is None else f"{evx:.1f}", "", "", "Includes debt; compare with similar companies"),
+        row("Free-cash-flow yield", na_bank if bank else _pct_txt(fcf_yield),
+            f"{mcap / fcf1:.0f}x price to free cash flow" if (fcf_yield and fcf1) else "",
+            "" if fcf_yield is None else ("Cheap" if fcf_yield >= 4 else ("Fair" if fcf_yield >= 2 else "Pricey")),
+            "4% or more is cheap"),
+        row("P/E versus its sector fund", "N/A" if (pe1 is None or not sector_pe) else f"{pe1:.1f} vs {sector_pe:.1f}", "", sec_sig,
+            "Rough benchmark only: the P/E of the matching sector ETF"),
+    ]
+    return [
+        ("Profitability", profit),
+        ("Growth", growth),
+        ("Cash and balance sheet", cash),
+        ("Shareholders", holders),
+        ("Valuation multiples", multiples),
+    ]
+
+
+def snapshot_notes(price: float, fin: dict, q: dict, v: dict):
+    """Plain-language strengths and watch-outs, using the same cut-offs as the Buy checklist."""
+    fin, q, v = fin or {}, q or {}, v or {}
+    bank = is_financial(fin)
+    table = q.get("table") if isinstance(q.get("table"), pd.DataFrame) else pd.DataFrame()
+    since = f" since {table.index[0]}" if not table.empty else ""
+    good, watch = [], []
+
+    if not bank:
+        roic = q.get("roic")
+        if roic is not None:
+            if roic >= 15:
+                good.append(f"Earns {roic:.0f}% a year on the money invested in the business (ROIC), a sign of a strong competitive position.")
+            elif roic < 10:
+                watch.append(f"Earns only {roic:.1f}% a year on invested capital (ROIC), below the 10% we look for.")
+    omc = q.get("op_margin_change")
+    if omc is not None:
+        if omc >= 2:
+            good.append(f"Operating margin has widened by {omc:.1f} points{since}: the business is becoming more profitable.")
+        elif omc <= -2:
+            watch.append(f"Operating margin has narrowed by {abs(omc):.1f} points{since}: costs are growing faster than sales.")
+    rc = q.get("rev_cagr")
+    if rc is not None:
+        if rc >= 10:
+            good.append(f"Sales are growing about {rc:.0f}% a year.")
+        elif rc < 5:
+            watch.append(f"Sales growth is slow (about {rc:.1f}% a year).")
+    if not bank:
+        fm = table["FCF margin %"].dropna() if "FCF margin %" in table.columns else pd.Series(dtype=float)
+        if len(fm) >= 2 and fm.iloc[-1] - fm.iloc[0] <= -5:
+            watch.append(
+                f"Free cash flow fell from {fm.iloc[0]:.0f}% to {fm.iloc[-1]:.0f}% of sales{since}: check whether heavier investment or weaker cash conversion is the cause."
+            )
+        fcf1 = fin.get("FCF (1Y)")
+        series = q.get("series") if isinstance(q.get("series"), pd.DataFrame) else pd.DataFrame()
+        ni_s = series["Net income"].dropna() if "Net income" in series.columns else pd.Series(dtype=float)
+        if fcf1 is not None and not ni_s.empty and ni_s.iloc[-1] > 0:
+            conv = fcf1 / (float(ni_s.iloc[-1]) * 1e9) * 100.0
+            if conv >= 100:
+                good.append(f"Free cash flow is {conv:.0f}% of reported profit: profits are backed by real cash.")
+            elif conv < 70:
+                watch.append(f"Only {conv:.0f}% of reported profit turned into free cash: look at capital spending and working capital.")
+        nd, nde = q.get("net_debt"), q.get("net_debt_ebitda")
+        if nd is not None and nd <= 0:
+            good.append("Holds more cash than debt (net cash), so it has room to ride out a bad year.")
+        elif nde is not None and nde > 3:
+            watch.append(f"Debt is high: net debt is {nde:.1f} times EBITDA (we prefer 3 or less).")
+        cov = q.get("interest_coverage")
+        if cov is not None and cov < 5:
+            watch.append(f"Interest is covered only {cov:.1f} times by operating profit (we prefer 5 or more).")
+        sbc = q.get("sbc_pct_fcf")
+        if sbc is not None and sbc > 20:
+            watch.append(f"Stock compensation equals {sbc:.0f}% of free cash flow, which quietly dilutes owners.")
+    sh = fin.get("Shares Outstanding (2Y)")
+    if sh and str(sh).startswith("Buying"):
+        good.append(f"Is shrinking its share count ({sh}): each share is a bigger slice of the company.")
+    elif sh and str(sh).startswith("Issuing"):
+        watch.append(f"Is issuing new shares ({sh}), which shrinks your slice.")
+
+    pct = v.get("pe_percentile")
+    if pct is not None:
+        if pct <= 30:
+            good.append(
+                f"Today's P/E ({v['pe_current']:.0f}) is lower than on about {100 - pct:.0f}% of days over the last {v['pe_years']:.0f} years: cheap against its own history."
+            )
+        elif pct >= 80:
+            watch.append(
+                f"Today's P/E ({v['pe_current']:.0f}) is higher than on about {pct:.0f}% of days over the last {v['pe_years']:.0f} years: expensive against its own history."
+            )
+    mcap, fcf1 = fin.get("Market Cap"), fin.get("FCF (1Y)")
+    if not bank and mcap and fcf1 is not None and mcap > 0:
+        fy = fcf1 / mcap * 100.0
+        if fy >= 4:
+            good.append(f"Free-cash-flow yield is {fy:.1f}%: a reasonable cash return for the price paid.")
+        elif fy < 2:
+            watch.append(f"Free-cash-flow yield is only {fy:.1f}%: you pay a lot for each dollar of cash the business makes.")
+    return good[:6], watch[:6]
+
+
+def _bars(df: pd.DataFrame, height: int = 240):
+    try:
+        st.bar_chart(df, stack=False, height=height)
+    except TypeError:
+        st.bar_chart(df, height=height)
+
+
+def render_business_snapshot(active_stock: str, price: float, fin: dict, quality: dict, valctx: dict):
+    st.subheader(f"Business snapshot - {active_stock}")
+    try:
+        inst = get_instrument_info(active_stock)
+    except Exception:
+        inst = {}
+    if inst.get("type") in ETF_TYPES:
+        st.info(
+            "This is a fund (ETF), so it has no company financial statements. Use Price charts and the Buy checklist "
+            "(only the Timing part applies to funds)."
+        )
+        return
+    fin, q, v = fin or {}, quality or {}, valctx or {}
+    if not fin and not q.get("available"):
+        st.info("Business data is not available for this ticker right now (new listing, fund, or a gap at Yahoo).")
+        return
+
+    bank = is_financial(fin)
+    sector = fin.get("Sector")
+    st.caption(
+        f"{sector + '. ' if sector else ''}Annual statements from Yahoo Finance (about 4 fiscal years, so growth rates cover about 3 years). "
+        "Signals are prompts to investigate, not verdicts. Not investment advice."
+    )
+
+    # ---- headline cards
+    mcap, pe1, pe3 = fin.get("Market Cap"), fin.get("P/E (1Y)"), fin.get("P/E (3Y Avg)")
+    fwd, peg = v.get("forward_pe"), v.get("peg")
+    fcf1 = fin.get("FCF (1Y)")
+    fcf_yield = (fcf1 / mcap * 100.0) if (not bank and mcap and fcf1 is not None and mcap > 0) else None
+    rate = fin.get("Div Rate (FWD)")
+    nd, nde = q.get("net_debt"), q.get("net_debt_ebitda")
+    if bank:
+        lev_value, lev_delta = "N/A", "financial company"
+    elif nd is not None and nd <= 0:
+        lev_value, lev_delta = "Net cash", _money_short(abs(nd))
+    elif nde is not None:
+        lev_value, lev_delta = f"{nde:.1f}x", _money_short(nd)
+    else:
+        lev_value, lev_delta = "N/A", None
+    cards = st.columns(6)
+    cards[0].metric("Market cap", _money_short(mcap))
+    cards[1].metric("P/E (latest year)", "N/A" if pe1 is None else f"{pe1:.1f}", None if pe3 is None else f"3-year avg {pe3:.1f}", delta_color="off")
+    cards[2].metric("Forward P/E", "N/A" if fwd is None else f"{fwd:.1f}", None if peg is None else f"PEG {peg:.2f}", delta_color="off")
+    cards[3].metric("Free-cash-flow yield", _pct_txt(fcf_yield), None if not fcf1 else f"FCF {_money_short(fcf1)}", delta_color="off")
+    cards[4].metric("Dividend yield", f"{rate / price * 100:.1f}%" if (rate and price) else "None", f"${rate:.2f} a year" if rate else None, delta_color="off")
+    cards[5].metric("Net debt / EBITDA", lev_value, lev_delta, delta_color="off")
+
+    # ---- strengths and watch-outs
+    good, watch = snapshot_notes(price, fin, q, v)
+    n1, n2 = st.columns(2)
+    with n1:
+        with st.container(border=True):
+            st.markdown(":green[**Strengths**]")
+            st.markdown("\n".join(f"- {t}" for t in good) if good else "Nothing stands out as unusually strong.")
+    with n2:
+        with st.container(border=True):
+            st.markdown(":orange[**Watch-outs**]")
+            st.markdown("\n".join(f"- {t}" for t in watch) if watch else "No red flags against the checklist cut-offs.")
+
+    # ---- charts
+    series = q.get("series") if isinstance(q.get("series"), pd.DataFrame) else pd.DataFrame()
+    table = q.get("table") if isinstance(q.get("table"), pd.DataFrame) else pd.DataFrame()
+    if not series.empty or not table.empty:
+        st.markdown("**Trends by fiscal year**")
+        c1, c2 = st.columns(2)
+        c3, c4 = st.columns(2)
+        s = series.copy()
+        s.index = [str(i) for i in s.index]
+        t = table.copy()
+        t.index = [str(i) for i in t.index]
+        with c1:
+            st.caption("Revenue and net income (billions of dollars)")
+            cols = [c for c in ("Revenue", "Net income") if c in s.columns]
+            if cols:
+                _bars(s[cols])
+        with c2:
+            st.caption("Margins (% of sales)")
+            cols = [c for c in ("Gross margin %", "Operating margin %", "Net margin %", "FCF margin %") if c in t.columns]
+            if cols:
+                st.line_chart(t[cols], height=240)
+        with c3:
+            st.caption("Net income versus free cash flow (billions of dollars)")
+            cols = [c for c in ("Net income", "Free cash flow") if c in s.columns]
+            if cols and not bank:
+                _bars(s[cols])
+            elif bank:
+                st.write("Not meaningful for banks and insurers.")
+        with c4:
+            st.caption("Shares outstanding (billions): falling is good")
+            if "Shares (billions)" in s.columns and not s["Shares (billions)"].dropna().empty:
+                _bars(s[["Shares (billions)"]].dropna())
+
+    # ---- detail tables
+    st.markdown("**Details by area**")
+    st.caption(
+        "Signal colours: green = Strong or Cheap, amber = OK or Fair, red = Watch or Pricey, grey = information only. "
+        "Cut-offs match the Buy checklist where it has one."
+    )
+    export_rows = []
+    for title, rows in snapshot_sections(price, fin, q, v):
+        st.markdown(f"**{title}**")
+        df = pd.DataFrame(rows)
+        sty = df.style
+        sty = (getattr(sty, "map", None) or sty.applymap)(_sig_style, subset=["Signal"])
+        st.dataframe(sty, hide_index=True, width="stretch", height=(len(df) + 1) * 35 + 3)
+        export_rows += [{"Section": title, **r} for r in rows]
+
+    st.download_button(
+        "Download these numbers (CSV)",
+        data=pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8"),
+        file_name=f"{active_stock}_business_snapshot.csv",
+        mime="text/csv",
+    )
+    if not table.empty:
+        with st.expander("Year-by-year table"):
+            yr = table.copy()
+            yr.index = [str(i) for i in yr.index]
+            st.dataframe(yr.round(1), width="stretch")
 
 
 def render_compare_tab(active_stock: str, favorites: list, r_default: float):
@@ -2333,7 +2758,7 @@ def render_compare_tab(active_stock: str, favorites: list, r_default: float):
                 continue
         if series:
             st.line_chart(pd.DataFrame(series))
-    st.caption("Screening aid only, not investment advice. Green does not mean buy: read the Long-term checklist for each stock.")
+    st.caption("Screening aid only, not investment advice. Green does not mean buy: read the Buy checklist for each stock.")
 
 
 def plot_long_term_trend(stock: str, trend: dict):
@@ -2625,7 +3050,7 @@ def main():
     macd_crossover = latest["MACD"] > latest["MACD_Signal"]
     reversal_conf = calculate_reversal_confidence(raw_data, active_stock)
 
-    # Fetch financial metrics once for both Financial metrics and Valuation tabs
+    # Fetch financial metrics once for both Business snapshot and Fair value tabs
     fin = fetch_financial_metrics(active_stock)
     analyst = fetch_analyst_view(active_stock)
 
@@ -2648,19 +3073,19 @@ def main():
         st.session_state["val_r_pct"] = float(r_default)
     st.session_state["val_defaults_for"] = active_stock
 
-    tab_charts, tab_lt, tab_cmp, tab_rank, tab_port, tab_fin, tab_val, tab_paper, tab_analyst, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_fin, tab_val, tab_analyst, tab_paper, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
         [
-            "Charts",
-            "Long-term checklist",
-            "Compare",
-            "Rankings",
-            "Portfolio",
-            "Financial metrics",
-            "Valuation",
-            "Paper investing check",
+            "Price charts",
+            "Buy checklist",
+            "Business snapshot",
+            "Fair value",
             "Analyst view",
-            "Favorites",
-            "Explanation",
+            "Test the signals",
+            "Compare stocks",
+            "Top 10 lists",
+            "My portfolio",
+            "My favorites",
+            "How it works",
         ]
     )
 
@@ -2724,10 +3149,10 @@ def main():
             )
 
     with tab_lt:
-        st.subheader(f"Long-term buy-point checklist - {active_stock}")
+        st.subheader(f"Buy checklist - {active_stock}")
         st.caption(
             "Three pillars: business quality, valuation, and timing. Thresholds are rules of thumb "
-            "(see Explanation tab). Valuation checks use the assumptions from the Valuation tab."
+            "(see How it works tab). Valuation checks use the assumptions from the Fair value tab."
         )
         if get_instrument_info(active_stock)["type"] in ETF_TYPES:
             st.info(
@@ -2812,39 +3237,7 @@ def main():
         render_portfolio_tab(r_default)
 
     with tab_fin:
-        st.subheader(f"Financial metrics - {active_stock}")
-        if not fin:
-            st.info("Financial metrics are not available for this ticker right now.")
-        else:
-            fin_pretty: dict[str, object] = {}
-            for k, v in fin.items():
-                if isinstance(v, (int, float)):
-                    if k == "Market Cap" or k == "Net Debt":
-                        av = abs(v)
-                        if av >= 1e9:
-                            fin_pretty[k] = f"{v / 1e9:.1f}B"
-                        elif av >= 1e6:
-                            fin_pretty[k] = f"{v / 1e6:.1f}M"
-                        else:
-                            fin_pretty[k] = f"{v:.1f}"
-                    elif k == "FCF (1Y)":
-                        if abs(v) >= 1e9:
-                            fin_pretty[k] = f"{v / 1e9:.1f}B"
-                        elif abs(v) >= 1e6:
-                            fin_pretty[k] = f"{v / 1e6:.1f}M"
-                        else:
-                            fin_pretty[k] = f"{v:.1f}"
-                    elif k.endswith("(2Y %)") or k.endswith("Growth (2Y %)"):
-                        fin_pretty[k] = f"{v:.1f}%"
-                    else:
-                        fin_pretty[k] = f"{v:.1f}"
-                else:
-                    fin_pretty[k] = v if v is not None else "N/A"
-            # Compact table: current price row + one row per metric
-            rows = [{"Metric": "Current price (latest close)", "Value": f"${current_price:.2f}"}]
-            rows += [{"Metric": k, "Value": str(v)} for k, v in fin_pretty.items()]
-            df_fin = pd.DataFrame(rows)
-            st.dataframe(df_fin, use_container_width=True, height=min(44 * (len(rows) + 1), 400), hide_index=True)
+        render_business_snapshot(active_stock, current_price, fin, quality, valctx)
 
     with tab_val:
         st.subheader(f"Valuation - {active_stock}")
@@ -2969,7 +3362,7 @@ def main():
                 )
 
     with tab_paper:
-        st.subheader(f"Paper investing check – {active_stock}")
+        st.subheader(f"Test the signals – {active_stock}")
         st.caption(
             "Simulates: buy when price is below the lower Bollinger Band with RSI under 30 and MACD crosses above its "
             "Signal line; sell the chosen % when price is above the upper band with RSI over 70 and MACD crosses below its "
@@ -3053,7 +3446,7 @@ def main():
         st.subheader(f"Analyst view - {active_stock}")
         st.caption(
             "Consensus, price targets and estimate revisions from Yahoo Finance. These are third-party analyst opinions, "
-            "not a recommendation from this app. The Explanation tab shows exactly how the verdict is calculated."
+            "not a recommendation from this app. The How it works tab shows exactly how the verdict is calculated."
         )
         if not analyst.get("available"):
             st.warning(
@@ -3178,7 +3571,7 @@ def main():
                         st.rerun()
 
     with tab_explain:
-        st.subheader("Explanation: what each tab helps you do and how to read every number")
+        st.subheader("How it works: what each tab helps you do and how to read every number")
         st.markdown(
             "Use this page as a guide to the whole app. Each section below covers one tab: "
             "**what it is for**, **how to use it**, and **what each metric means and how to read it**."
@@ -3188,24 +3581,27 @@ def main():
             st.markdown("""
 | Tab | The question it answers | Use it when |
 |---|---|---|
-| **Charts** | Is the price stretched or turning right now? | Timing an entry over the next days to weeks |
-| **Long-term checklist** | Is this a good business, at a good price, at a sensible moment? | First screen for any stock; the main decision tab |
-| **Compare** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
-| **Rankings** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your Favorites and the wider stock list |
-| **Portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
-| **Financial metrics** | How healthy are the company's profit, growth, cash and debt? | Checking the business behind the ticker |
-| **Valuation** | What could it be worth, and what is the most I should pay? | Setting a buy price from your own assumptions |
-| **Paper investing check** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
+| **Price charts** | Is the price stretched or turning right now? | Timing an entry over the next days to weeks |
+| **Buy checklist** | Is this a good business, at a good price, at a sensible moment? | First screen for any stock; the main decision tab |
+| **Business snapshot** | How healthy and fast-growing is the business, and what stands out? | Understanding the company behind the ticker |
+| **Fair value** | What could it be worth, and what is the most I should pay? | Setting a buy price from your own assumptions |
 | **Analyst view** | What do professional analysts think, and is that changing? | A cross-check against your own view |
-| **Favorites** | Shortcuts to the stocks I follow | Saving a search through the dropdown |
+| **Test the signals** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
+| **Compare stocks** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
+| **Top 10 lists** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your favorites and the wider stock list |
+| **My portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
+| **My favorites** | Shortcuts to the stocks I follow | Saving a search through the dropdown |
+| **How it works** | What does each number mean? | Whenever a metric is unclear (this page) |
+
+The first six tabs are about the **one stock you loaded**. The next four look **across stocks** or at your own holdings.
 
 **Suggested workflow**
 1. Pick a ticker at the top (dropdown, or type your own) and click **Load chart**.
-2. Open **Long-term checklist**. Read the verdict and the three scores (Quality, Valuation, Timing). A failed check is a question to investigate, not an automatic no.
-3. Open **Financial metrics** and **Valuation** to understand the business and set your own growth, multiple and margin-of-safety assumptions. Compare the current price with the **Buy price**.
-4. Use **Charts** to judge timing, and **Paper investing check** to see whether those timing signals have actually worked for this stock.
-5. Check **Rankings** for new ideas (and for alerts on your Favorites) and **Portfolio** for profit-taking signals on what you own.
-6. Cross-check with **Analyst view**. Keep the stocks you follow in **Favorites**.
+2. Open **Buy checklist**. Read the verdict and the three scores (Quality, Valuation, Timing). A failed check is a question to investigate, not an automatic no.
+3. Open **Business snapshot** to see the business's strengths and watch-outs, then **Fair value** to set your own growth, multiple and margin-of-safety assumptions. Compare the current price with the **Buy price**.
+4. Use **Price charts** to judge timing, and **Test the signals** to see whether those timing signals have actually worked for this stock.
+5. Cross-check with **Analyst view**.
+6. Use **Compare stocks** to choose between candidates, **Top 10 lists** for new ideas (and alerts on your favorites), and **My portfolio** for profit-taking signals on what you own. Keep the stocks you follow in **My favorites**.
 
 **Ideal long-term buy:** a high-quality business (Quality), priced below your buy price (Valuation), at a moment when the trend is intact and the price has pulled back (Timing).
 """)
@@ -3221,7 +3617,7 @@ def main():
 - **Not investment advice.** The app organizes public data and simple rules; it cannot see the future.
 """)
 
-        with st.expander("Charts tab: short-term timing"):
+        with st.expander("Price charts tab: short-term timing"):
             st.markdown("""
 **What it helps you do:** judge whether the price is unusually low or turning up right now, and whether volume supports a bounce. It says nothing about the quality of the business, so use it to time an entry, not to choose what to own.
 
@@ -3248,7 +3644,7 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **Last 30 periods (4h):** the raw indicator values.
 """)
 
-        with st.expander("Long-term checklist tab: the main decision tab"):
+        with st.expander("Buy checklist tab: the main decision tab"):
             st.markdown("""
 **What it helps you do:** answer "is this a good long-term buy right now?" in one place. It scores three pillars, each made of Pass / Fail / N/A checks (N/A checks are ignored):
 - **Quality:** is it a business worth owning for years?
@@ -3282,7 +3678,7 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **No heavy dilution:** the share count has not grown more than 5% in 2 years.
 
 **Valuation checks (is the price attractive?)**
-- **Price at or below the EPS-model buy price (10Y)** and **at or below the DCF buy price (10Y):** use the growth, multiple, return and margin-of-safety inputs from the Valuation tab, so they are only as good as your assumptions.
+- **Price at or below the EPS-model buy price (10Y)** and **at or below the DCF buy price (10Y):** use the growth, multiple, return and margin-of-safety inputs from the Fair value tab, so they are only as good as your assumptions.
 - **P/E at or below the 40th percentile of its own history:** the stock is cheaper than it usually is.
 - **FCF yield at least 4%:** free cash flow divided by market cap. About the cash return if you bought the whole company; 4% equals paying 25 times FCF.
 - **Forward P/E below trailing P/E:** analysts expect earnings to grow.
@@ -3293,35 +3689,42 @@ Because each check is worth 25, the score can only be 0, 25, 50, 75 or 100. **Ab
 - **At least 10% below the 52-week high:** a real pullback rather than chasing a rally.
 - **Weekly RSI below 50:** momentum has cooled.
 - **Not collapsing versus SPY:** the 6-month return is not more than 15 points behind the S&P 500 ETF.
-- **4-hour triggers, at least 2 of 3:** the Charts tiles (Below BB Low, RSI under 30, MACD above Signal).
+- **4-hour triggers, at least 2 of 3:** the Price charts tiles (Below BB Low, RSI under 30, MACD above Signal).
 
 **Banks and insurers (Financial Services):** ROIC, leverage, interest coverage, FCF and DCF checks show N/A, because debt and cash are part of how they operate. Use the EPS model for them.
 
 **ETFs and funds:** they have no company statements, so Quality and Valuation show N/A and only the Timing pillar applies.
 """)
 
-        with st.expander("Financial metrics tab: the business behind the ticker"):
+        with st.expander("Business snapshot tab: the business behind the ticker"):
             st.markdown("""
-**What it helps you do:** see the company's profitability, growth, share count, cash flow and debt in one list, and compare its price multiples with its sector. All values come from Yahoo's annual financial statements. P/E figures use reported (GAAP) profit, which can include one-off items and may differ from the adjusted earnings you see elsewhere.
+**What it helps you do:** see how healthy and how fast-growing the business is, and whether the price looks reasonable, on one page. All values come from Yahoo's annual financial statements (about 4 fiscal years, so growth rates cover about 3 years). Profit figures are reported (GAAP) numbers and can include one-off items, so they can differ from the adjusted earnings you see elsewhere.
 
-- **Current price (latest close):** the last 4-hour close, shown for reference.
-- **P/E (3Y Avg):** market cap divided by the average net income of the last 3 fiscal years. Smooths out one unusual year. Lower means cheaper, but check that profit is not collapsing.
-- **P/E (1Y):** market cap divided by the latest year's net income. If P/E (1Y) is well below P/E (3Y Avg), recent profit is above its average (or the price fell).
-- **Revenue Growth (2Y %):** the percent change in sales from two years ago to the latest year. Growing sales are the foundation of long-term returns.
-- **Profit Growth (2Y vs Today):** Up, Down or Flat comparing net income today with two years ago.
-- **Shares Outstanding (2Y):** Issuing Shares, Buying Back or Neutral, with the percent change. More than 5% up is dilution (your slice shrinks); more than 5% down means buybacks (your slice grows).
-- **Div Rate (FWD):** expected annual dividend per share, when the company pays one.
-- **FCF Multiple (MC/FCF):** market cap divided by free cash flow. Lower is cheaper. 20 means you pay 20 dollars per 1 dollar of yearly free cash flow (a 5% FCF yield).
-- **Market Cap:** share price times shares outstanding, shown in billions (B) or millions (M).
-- **Sector PE:** the trailing P/E of the sector fund (for example XLK for technology) matching the company's sector. It is an approximate benchmark, not a true peer average.
-- **EPS (1Y):** net income divided by shares for the latest year. This is the starting point (M0) of the EPS valuation model.
-- **Net Debt:** Yahoo's figure for total debt (including leases) minus cash and short-term investments. A negative number means more cash than debt (net cash).
-- **Sector:** Yahoo's sector label; it also decides whether debt and cash-flow checks apply (they do not for financial companies).
-- **Shares Latest:** the share count used for EPS and for the DCF per-share value.
-- **FCF (1Y):** free cash flow for the latest year, from Yahoo's cash flow statement, or operating cash flow minus capital spending when that line is missing.
+**Top row (six headline numbers)**
+- **Market cap:** share price times shares outstanding.
+- **P/E (latest year):** market cap divided by last year's net income, with the 3-year average underneath. A P/E well below its 3-year average means recent profit is above its average (or the price fell).
+- **Forward P/E:** price divided by the profit analysts expect next year, with the **PEG ratio** underneath (P/E divided by expected growth; 1 or less is cheap, 2 or less is fair).
+- **Free-cash-flow yield:** free cash flow divided by market cap. Higher is cheaper; 4% or more is the checklist's pass mark. The underlying multiple is market cap divided by free cash flow (20x is a 5% yield).
+- **Dividend yield:** the expected yearly dividend per share divided by the price.
+- **Net debt / EBITDA:** how many years of operating earnings it would take to repay debt after using cash. **Net cash** means cash exceeds debt.
+
+**Strengths and watch-outs:** plain-language notes written from the numbers using the same cut-offs as the Buy checklist (ROIC, margin direction, growth, cash conversion, debt, interest cover, stock compensation, share count, P/E against its own history, cash yield). A watch-out is a question to investigate, not a reason to reject the stock.
+
+**Trends by fiscal year:** four small charts: revenue and net income; the four margins; net income versus free cash flow (a widening gap, with cash falling behind profit, deserves a closer look); and the share count (falling is good).
+
+**Details by area.** Each row shows the latest number, a trend or detail, a **Signal** and what good looks like. Signal colours: green is Strong or Cheap, amber is OK or Fair, red is Watch or Pricey, grey means information only.
+- **Profitability:** gross, operating, net and free-cash-flow margins (profit as a share of sales, with the change since the first year shown), **ROIC** (operating profit after tax divided by the capital invested in the business; 10% or more passes, 15% or more is strong) and **ROE** (net income divided by shareholders' equity, from Yahoo).
+- **Growth:** yearly growth (compound rate) of revenue, net income, earnings per share and free cash flow, and how many years earnings per share rose. **Revenue, total change over 2 years** is the full two-year change, not a yearly rate. Net income vs 2 years ago is Up, Down or Flat.
+- **Cash and balance sheet:** free cash flow (Yahoo's figure, or operating cash flow minus capital spending), free cash flow as a share of net income (how much of reported profit becomes cash), **net debt** (Yahoo's total debt including leases minus cash; negative means net cash), net debt / EBITDA, **interest coverage** (operating profit divided by interest expense) and the **current ratio** (short-term assets divided by short-term bills; 1 or more means bills can be paid from current assets).
+- **Shareholders:** share count change over 2 years (more than 5% up is Issuing, more than 5% down is Buying Back), stock compensation as a share of free cash flow, and the dividend.
+- **Valuation multiples:** P/E for the latest year, P/E against its own history (percentile: 40th or lower is cheap, above 70th is pricey), forward P/E, PEG, EV / EBITDA (enterprise value, which includes debt, divided by operating earnings before depreciation), cash yield, and P/E against the matching **sector fund** (a rough benchmark, not a true peer average).
+
+**Banks, insurers and funds:** for banks and insurers, margins and returns are shown but debt, cash-flow and ROIC rows are marked not applicable. Funds (ETFs) have no company statements, so the tab explains that and points you to the charts and the Timing checks.
+
+**Download:** the button saves every row on the tab as a CSV file. The **Year-by-year table** expander shows the margin history behind the charts.
 """)
 
-        with st.expander("Valuation tab: what it could be worth and the most to pay"):
+        with st.expander("Fair value tab: what it could be worth and the most to pay"):
             st.markdown("""
 **What it helps you do:** turn your own beliefs about growth and future valuation into a **fair value** and a **buy price**, and see whether today's price is in the buy zone. The answers depend entirely on your inputs, so treat them as scenarios, not predictions.
 
@@ -3354,7 +3757,7 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 **Sensitivity grid:** the 10-year Buy price for several growth rates (rows) and terminal multiples (columns), for the model you choose. **Green** cells mean today's price is at or below that buy price; **red** means above. If most of the grid is red, the stock needs optimistic assumptions to look cheap.
 """)
 
-        with st.expander("Paper investing check tab: test the timing rules on history"):
+        with st.expander("Test the signals tab: how the timing rules would have done"):
             st.markdown("""
 **What it helps you do:** see how the app's own technical buy and sell rules would have performed on this stock over the last 1-2 years, before you rely on them.
 
@@ -3382,7 +3785,7 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 
         with st.expander("Analyst view tab: what professional analysts think"):
             st.markdown("""
-**What it helps you do:** see the Wall Street consensus (ratings, price targets, estimate changes) and whether it is improving or deteriorating, as a cross-check on your own view. It is third-party opinion from **Yahoo Finance**, not a recommendation from this app, and it is **not** part of the Long-term checklist score.
+**What it helps you do:** see the Wall Street consensus (ratings, price targets, estimate changes) and whether it is improving or deteriorating, as a cross-check on your own view. It is third-party opinion from **Yahoo Finance**, not a recommendation from this app, and it is **not** part of the Buy checklist score.
 
 **What the tab shows**
 - **Yahoo consensus:** Yahoo's own label (for example Buy).
@@ -3410,7 +3813,7 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 - Targets and ratings lag the market, and small companies may have few or no analysts.
 """)
 
-        with st.expander("Compare tab: put 2-4 stocks side by side"):
+        with st.expander("Compare stocks tab: put 2-4 stocks side by side"):
             st.markdown("""
 **What it helps you do:** choose between similar stocks, or check a candidate against something you already own, by lining up the same numbers for each.
 
@@ -3425,11 +3828,11 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 **Read it with care:** each stock's valuation uses its own suggested growth, multiple and margin of safety, so Valuation scores show how each price compares with that stock's own assumptions, not with a common yardstick. Compare ETFs only on Timing. Green means better on that row, not buy.
 """)
 
-        with st.expander("Rankings tab: top 10 buy and top 10 avoid"):
+        with st.expander("Top 10 lists tab: top 10 buy and top 10 avoid"):
             st.markdown("""
 **What it helps you do:** find the best buy candidates and the most overvalued names across a large list of stocks, and see how your Favorites compare, without opening stocks one at a time.
 
-**Where the data comes from:** a daily scan (a GitHub Action) scores every symbol in Favorites.csv and stockList.csv with the same Long-term checklist and each stock's suggested valuation defaults, then saves rankings.csv. This tab shows that file. **Scan my Favorites now** scores only your Favorites on demand (slow, and it replaces the file view until you clear it).
+**Where the data comes from:** a daily scan (a GitHub Action) scores every symbol in Favorites.csv and stockList.csv with the same Buy checklist and each stock's suggested valuation defaults, then saves rankings.csv. This tab shows that file. **Scan my Favorites now** scores only your Favorites on demand (slow, and it replaces the file view until you clear it).
 
 **Who can be ranked:** operating companies with enough scored checks (at least 4 Quality checks and 3 Valuation checks). ETFs are scored on Timing only and are never ranked. Banks and insurers have several checks that show N/A, so they usually fall below the minimum: they still get a verdict but are not ranked.
 
@@ -3439,14 +3842,14 @@ Defaults are suggested per stock: g is the median of its past revenue, EPS and F
 
 **Columns:** Q / V / T is the Quality, Valuation and Timing score in percent. **Upside to fair** is the average gap between fair value and the price across the available models (negative means the price is above fair value). **Overbought** is how many of the 3 profit-taking signals are on. A star marks your Favorites and **NEW** marks stocks that entered the list in the latest scan.
 
-**Profit-taking watch:** your Favorites with a Trim, Review or Watch signal (rules under the Portfolio tab).
+**Profit-taking watch:** your Favorites with a Trim, Review or Watch signal (rules under the My portfolio tab).
 
 **Alerts:** the same daily scan opens a GitHub issue, which GitHub emails to you, when one of your Favorites newly enters the top 10 buy list or the top 10 avoid list, or newly reaches the Trim level.
 
 **Limits:** results depend on the default growth, multiple and margin of safety for each stock. Fast growers tend to look expensive because those defaults are capped. Treat the lists as a place to start research.
 """)
 
-        with st.expander("Portfolio tab: your positions and profit-taking signals"):
+        with st.expander("My portfolio tab: your positions and profit-taking signals"):
             st.markdown("""
 **What it helps you do:** see your gain or loss on each position and which holdings are worth trimming, reviewing or just watching.
 
@@ -3468,10 +3871,10 @@ A position over 15% of the portfolio adds a rebalancing note. If you are at a lo
 **Read it with care:** signals are prompts, not instructions. Selling a core long-term holding has tax and opportunity costs, and fast growers can stay overbought for a long time.
 """)
 
-        with st.expander("Favorites tab: your shortlist"):
+        with st.expander("My favorites tab: your shortlist"):
             st.markdown("""
 **What it helps you do:** keep the stocks you follow one click away instead of searching the dropdown every time.
-- Your list comes from **Favorites.csv** in the project and appears at the top of the ticker dropdown. The Rankings tab and the daily scan use the same file.
+- Your list comes from **Favorites.csv** in the project and appears at the top of the ticker dropdown. The Top 10 lists tab and the daily scan use the same file.
 - **Add current stock to Favorites** adds the stock you are viewing for this session only.
 - **Load** opens that stock in every tab. **Remove** deletes it from the list.
 - **Important:** additions and removals made in the app last only for the current browser session. To change the permanent list, edit Favorites.csv on GitHub.
