@@ -1,11 +1,16 @@
 import json
-from datetime import datetime, timedelta
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import time
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 from ta.momentum import RSIIndicator
@@ -1667,7 +1672,8 @@ def _reset_val_inputs(sugg: dict, r_default: float):
 
 def _clear_data_caches():
     """Forget cached company data and any recent failures, so the next load asks Yahoo again."""
-    for fn in (_fetch_financial_metrics_cached, _fetch_quality_metrics_cached, _fetch_valuation_context_cached, _fetch_analyst_raw):
+    for fn in (_fetch_financial_metrics_cached, _fetch_quality_metrics_cached, _fetch_valuation_context_cached, _fetch_analyst_raw,
+               _fetch_news_cached, _fetch_market_snapshot_cached, _fetch_moves_cached):
         try:
             fn.clear()
         except Exception:
@@ -3380,6 +3386,480 @@ def plot_reversal_diagnostics(raw_1h: pd.DataFrame, indicator_4h: pd.DataFrame, 
     return fig
 
 
+# ---------------------------------------------------------------------------
+# News and market context (free sources, no keys). Google News RSS is the primary feed
+# because it kept working when Yahoo was rate-limiting; Yahoo's news is the backup.
+# ---------------------------------------------------------------------------
+_NEWS_NOISE = ("quote & history", "stock price, news", "charts, data", "price, news, quote", "live stock price", "stock quote")
+# Auto-generated fund-filing posts ("fund X acquires new shares of Y") add nothing for a long-term investor
+_NEWS_FILLER = ("acquires new", "acquires shares", "sells shares of", "buys shares of", "boosts stake", "trims stake", "raises stake",
+                "lowers stake", "increases stake", "reduces stake", "takes position in", "new position in", "shares bought by", "shares sold by")
+_NAME_SUFFIX = re.compile(
+    r"\b(incorporated|inc|corporation|corp|company|co|holdings?|plc|ltd|limited|group|n\.v|nv|class [a-c]|cl [a-c]|common stock|ordinary shares?|adr)\b\.?",
+    re.I,
+)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _clean_company_name(name: str) -> str:
+    """'United Airlines Holdings, Inc.' -> 'United Airlines' (a better news search phrase)."""
+    n = re.sub(r"\([^)]*\)", " ", name or "")
+    n = _NAME_SUFFIX.sub(" ", n)
+    n = re.sub(r"[,]+", " ", n)
+    n = re.sub(r"\s+", " ", n).strip(" .-")
+    return n or (name or "").strip()
+
+
+def _parse_news_time(text):
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+    except Exception:
+        try:
+            dt = pd.to_datetime(text, utc=True).to_pydatetime()
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _google_news(query: str, days: int) -> list:
+    """Headlines from Google News RSS. Raises on network or HTTP errors."""
+    url = f"https://news.google.com/rss/search?q={quote(f'{query} when:{days}d')}&hl=en-US&gl=US&ceid=US:en"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+    r.raise_for_status()
+    out = []
+    for it in ET.fromstring(r.content).findall("./channel/item"):
+        title = (it.findtext("title") or "").strip()
+        src_el = it.find("source")
+        source = (src_el.text or "").strip() if src_el is not None else ""
+        if source and title.endswith(" - " + source):
+            title = title[: -len(source) - 3].rstrip()
+        out.append({"title": title, "source": source, "published": _parse_news_time(it.findtext("pubDate")),
+                    "url": it.findtext("link") or "", "via": "Google News"})
+    return out
+
+
+def _yahoo_time(c: dict):
+    stamp = c.get("pubDate") or c.get("displayTime")
+    if stamp:
+        return _parse_news_time(stamp)
+    if c.get("providerPublishTime"):
+        return datetime.fromtimestamp(c["providerPublishTime"], tz=timezone.utc)
+    return None
+
+
+def _yahoo_news(symbol: str) -> list:
+    """Headlines tagged to a symbol by Yahoo Finance (backup source). Raises when Yahoo is unavailable."""
+    out = []
+    for n in (yf.Ticker(symbol).news or []):
+        c = n.get("content") or n
+        title = (c.get("title") or "").strip()
+        link = ((c.get("canonicalUrl") or c.get("clickThroughUrl") or {}).get("url")) or c.get("link") or ""
+        if title and link:
+            out.append({"title": title, "source": ((c.get("provider") or {}).get("displayName")) or c.get("publisher") or "",
+                        "published": _yahoo_time(c),
+                        "url": link, "via": "Yahoo Finance"})
+    return out
+
+
+def _dedupe_news(items: list) -> list:
+    seen, out = set(), []
+    for it in sorted(items, key=lambda x: x.get("published") or _EPOCH, reverse=True):
+        title = it.get("title") or ""
+        low = title.lower()
+        if not title or any(p in low for p in _NEWS_NOISE) or any(p in low for p in _NEWS_FILLER):
+            continue
+        if sum(1 for ch in title if ord(ch) > 0x24F) > 0.3 * len(title):  # mostly non-Latin script (not readable for this app)
+            continue
+        key = re.sub(r"[^a-z0-9]+", "", low)[:70]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_news_cached(symbol: str, name: str, kind: str) -> list:
+    """kind = 'stock' | 'etf' | 'market'. RAISES when no source worked, so a failure is never cached."""
+    items, ok, errors = [], False, []
+    if kind == "market":
+        queries, first_days, wide_days, need = ["stock market today", "Wall Street stocks Dow S&P 500 Nasdaq"], 1, 3, 8
+    else:
+        word = "ETF" if kind == "etf" else "stock"
+        queries = [f'"{name}" {word}' if name else f"{symbol} {word}"]
+        first_days, wide_days, need = 7, 30, 5
+    try:
+        for q in queries:
+            items += _google_news(q, first_days)
+        if len(items) < need:
+            for q in queries:
+                items += _google_news(q, wide_days)
+        ok = True
+    except Exception as exc:
+        errors.append(exc)
+    if (not ok) or len(items) < 3:
+        try:
+            items += _yahoo_news("^GSPC" if kind == "market" else symbol)
+            ok = True
+        except Exception as exc:
+            errors.append(exc)
+    if not ok:
+        raise RuntimeError(f"no news source answered: {errors[:1]}")
+    if kind != "market" and not name:
+        pat = re.compile(rf"(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])")
+        items = [i for i in items if pat.search(i.get("title") or "")]
+    return _dedupe_news(items)
+
+
+def get_news(symbol: str, name: str = "", kind: str = "stock"):
+    """Returns (headlines, worked). worked=False means no source answered (shown to the user as a retry notice)."""
+    key = ("news", symbol, kind)
+    t = _NEG_CACHE.get(key)
+    if t is not None and time.time() - t < _NEG_TTL:
+        return [], False
+    try:
+        return _fetch_news_cached(symbol, _clean_company_name(name), kind), True
+    except Exception:
+        _NEG_CACHE[key] = time.time()
+        return [], False
+
+
+def _news_ago(dt) -> str:
+    if not dt:
+        return ""
+    secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    if secs < 3600:
+        return f"{max(1, int(secs // 60))} min ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h ago"
+    d = int(secs // 86400)
+    return f"{d} day{'s' if d > 1 else ''} ago"
+
+
+def _md_safe(text: str) -> str:
+    """Escape characters that Streamlit markdown would treat as formatting or math (headlines often contain dollar signs)."""
+    return re.sub(r"([\\`*_~$\[\]])", r"\\\1", text or "")
+
+
+def render_headlines(items: list, limit: int = 15, max_age_days=None):
+    now = datetime.now(timezone.utc)
+    shown = []
+    for it in items:
+        if max_age_days is not None and it.get("published") and (now - it["published"]).days >= max_age_days:
+            continue
+        shown.append(it)
+        if len(shown) >= limit:
+            break
+    if not shown:
+        st.info("No headlines found for this period.")
+        return
+    lines = []
+    for it in shown:
+        url = (it.get("url") or "").replace(" ", "%20").replace(")", "%29")
+        meta = ", ".join(x for x in [_md_safe(it.get("source") or ""), _news_ago(it.get("published"))] if x)
+        lines.append(f"- [{_md_safe(it['title'])}]({url}) - {meta}" if url else f"- {_md_safe(it['title'])} - {meta}")
+    st.markdown("\n".join(lines))
+
+
+_MKT_INDEX = [
+    ("^GSPC", "S&P 500"), ("^IXIC", "Nasdaq Composite"), ("^DJI", "Dow Jones"), ("^RUT", "Russell 2000 (small companies)"),
+    ("^VIX", "VIX (fear gauge)"), ("^TNX", "10-year Treasury yield"), ("CL=F", "Oil (WTI)"), ("GC=F", "Gold"),
+]
+_MKT_SECTORS = [
+    ("XLK", "Technology"), ("XLC", "Communication"), ("XLY", "Consumer discretionary"), ("XLP", "Consumer staples"),
+    ("XLE", "Energy"), ("XLF", "Financials"), ("XLV", "Health care"), ("XLI", "Industrials"),
+    ("XLB", "Materials"), ("XLRE", "Real estate"), ("XLU", "Utilities"),
+]
+
+
+def _download_closes(symbols: list, days: int) -> pd.DataFrame:
+    end = datetime.now() + timedelta(days=1)
+    start = end - timedelta(days=days)
+    data = yf.download(symbols, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval="1d",
+                       auto_adjust=True, progress=False, threads=False)
+    if data is None or data.empty:
+        raise RuntimeError("no price data")
+    close = data["Close"]
+    if isinstance(close, pd.Series):
+        close = close.to_frame(symbols[0])
+    return close
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_market_snapshot_cached() -> dict:
+    """Index, sector and trend numbers from Yahoo daily prices. RAISES when the S&P 500 is missing (so failures are not cached)."""
+    close = _download_closes([s for s, _ in _MKT_INDEX + _MKT_SECTORS], 420)
+    if "^GSPC" not in close.columns or close["^GSPC"].dropna().shape[0] < 2:
+        raise RuntimeError("S&P 500 data missing")
+
+    def rows(pairs):
+        out = []
+        for sym, label in pairs:
+            if sym not in close.columns:
+                continue
+            s = close[sym].dropna()
+            if len(s) < 2:
+                continue
+            last, prev = float(s.iloc[-1]), float(s.iloc[-2])
+            if sym == "^TNX" and last > 20:  # some feeds quote the yield times 10
+                last, prev = last / 10, prev / 10
+            out.append({"Symbol": sym, "Name": label, "Last": last, "Prev": prev,
+                        "Change %": (last / prev - 1) * 100 if prev else None, "Change pts": last - prev})
+        return pd.DataFrame(out)
+
+    sp = close["^GSPC"].dropna()
+    last = float(sp.iloc[-1])
+    ma200 = float(sp.tail(200).mean()) if len(sp) >= 150 else None
+    hi52 = float(sp.tail(252).max())
+    return {
+        "indices": rows(_MKT_INDEX), "sectors": rows(_MKT_SECTORS),
+        "sp": {"last": last, "ma200": ma200, "pct_vs_200": (last / ma200 - 1) * 100 if ma200 else None,
+               "high52": hi52, "drawdown": (last / hi52 - 1) * 100},
+        "asof": sp.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
+def get_market_snapshot():
+    key = ("market_snapshot", "")
+    t = _NEG_CACHE.get(key)
+    if t is not None and time.time() - t < _NEG_TTL:
+        return None
+    try:
+        return _fetch_market_snapshot_cached()
+    except Exception:
+        _NEG_CACHE[key] = time.time()
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_moves_cached(symbols: tuple) -> pd.DataFrame:
+    close = _download_closes(list(symbols), 12)
+    out = []
+    for sym in close.columns:
+        s = close[sym].dropna()
+        if len(s) >= 2 and float(s.iloc[-2]) > 0:
+            out.append({"Symbol": sym, "Price": float(s.iloc[-1]), "Change %": (float(s.iloc[-1]) / float(s.iloc[-2]) - 1) * 100})
+    if not out:
+        raise RuntimeError("no moves")
+    return pd.DataFrame(out)
+
+
+def get_moves(symbols: list):
+    key = ("moves", "")
+    t = _NEG_CACHE.get(key)
+    if t is not None and time.time() - t < _NEG_TTL:
+        return None
+    try:
+        return _fetch_moves_cached(tuple(symbols))
+    except Exception:
+        _NEG_CACHE[key] = time.time()
+        return None
+
+
+def _snap_change(snap, symbol: str):
+    if not snap:
+        return None
+    df = snap["indices"]
+    row = df[df["Symbol"] == symbol]
+    if row.empty or pd.isna(row.iloc[0]["Change %"]):
+        return None
+    return float(row.iloc[0]["Change %"])
+
+
+def _move_words(x: float) -> str:
+    if abs(x) < 0.15:
+        return "about flat"
+    return f"{'up' if x > 0 else 'down'} {abs(x):.1f}%"
+
+
+def market_reading(snap: dict, moves):
+    """Plain-language reading of the numbers. Returns (bullets, is_big_move). It describes WHAT moved; the headlines give the reasons."""
+    ind = snap["indices"].set_index("Symbol")
+    sec = snap["sectors"].sort_values("Change %", ascending=False)
+    bullets = []
+
+    def chg(sym):
+        return float(ind.loc[sym, "Change %"]) if sym in ind.index and pd.notna(ind.loc[sym, "Change %"]) else None
+
+    sp_c, nas_c, dow_c = chg("^GSPC"), chg("^IXIC"), chg("^DJI")
+    parts = [f"{n} {_move_words(v)}" for n, v in (("S&P 500", sp_c), ("Nasdaq", nas_c), ("Dow", dow_c)) if v is not None]
+    line = "; ".join(parts) + "."
+    if nas_c is not None and dow_c is not None:
+        if nas_c - dow_c <= -1:
+            line += " The technology-heavy Nasdaq is doing much worse than the Dow, so the selling is concentrated in growth and tech names."
+        elif nas_c - dow_c >= 1:
+            line += " The Nasdaq is doing much better than the Dow, so growth and tech names are leading."
+    bullets.append(line)
+
+    vix_last = vix_c = None
+    if "^VIX" in ind.index:
+        vix_last, vix_c = float(ind.loc["^VIX", "Last"]), chg("^VIX")
+        band = "calm" if vix_last < 15 else "normal" if vix_last < 20 else "elevated (investors are nervous)" if vix_last < 30 else "high (stress)"
+        bullets.append(f"The VIX fear gauge is {vix_last:.1f}, which is {band}.")
+    if "^TNX" in ind.index:
+        bps = float(ind.loc["^TNX", "Change pts"]) * 100
+        bullets.append(f"The 10-year Treasury yield is {float(ind.loc['^TNX', 'Last']):.2f}% ({bps:+.0f} basis points today). "
+                       "Rising yields tend to pressure growth stocks; falling yields tend to help them.")
+    for sym, label in (("CL=F", "Oil"), ("GC=F", "Gold")):
+        v = chg(sym)
+        if v is not None and abs(v) >= 2:
+            bullets.append(f"{label} is {_move_words(v)}, a large move.")
+    if not sec.empty:
+        up = int((sec["Change %"] > 0).sum())
+        best, worst = sec.iloc[:2], sec.iloc[-2:]
+        fmt_s = lambda df_: ", ".join(f"{row['Name']} ({row['Change %']:+.1f}%)" for _, row in df_.iterrows())
+        bullets.append(f"{up} of {len(sec)} sectors are up. Strongest: {fmt_s(best)}. Weakest: {fmt_s(worst[::-1])}.")
+    spd = snap["sp"]
+    trend = ""
+    if spd.get("pct_vs_200") is not None:
+        trend = f"The S&P 500 is {abs(spd['pct_vs_200']):.1f}% {'above' if spd['pct_vs_200'] >= 0 else 'below'} its 200-day average. "
+    dd = spd["drawdown"]
+    kind = "near its 52-week high" if dd > -5 else "in a pullback (5-10% off the high)" if dd > -10 else "in a correction (10-20% off the high)" if dd > -20 else "in bear-market territory (20%+ off the high)"
+    bullets.append(f"{trend}It is {abs(dd):.1f}% below its 52-week high, {kind}.")
+    if moves is not None and not moves.empty:
+        down = int((moves["Change %"] < 0).sum())
+        worst3 = moves.sort_values("Change %").head(3)
+        bullets.append(f"{down} of your {len(moves)} favorites are down today. Biggest drops: "
+                       + ", ".join(f"{row['Symbol']} ({row['Change %']:+.1f}%)" for _, row in worst3.iterrows()) + ".")
+    big = bool((sp_c is not None and sp_c <= -2) or (nas_c is not None and nas_c <= -3)
+               or (vix_last is not None and vix_last >= 30) or (vix_c is not None and vix_c >= 15))
+    return bullets, big
+
+
+def _colour_col(raw: pd.Series, invert=()) -> list:
+    """Green for positive, red for negative; rows in invert (VIX, yields) use the opposite colours."""
+    out = []
+    for i, v in raw.items():
+        if pd.isna(v) or abs(v) < 1e-9:
+            out.append("")
+            continue
+        good = v > 0
+        if i in invert:
+            good = not good
+        out.append("color: #2e9e5b; font-weight: 600" if good else "color: #d64545; font-weight: 600")
+    return out
+
+
+def render_market_tab(favorites: list):
+    st.subheader("Market today")
+    st.caption("What moved today, in plain numbers, and the day's headlines. Prices are Yahoo's latest daily data and may lag by some minutes.")
+    snap = get_market_snapshot()
+    if snap is None:
+        st.warning("Yahoo did not return market prices right now (usually a short rate limit). Headlines below may still work.")
+        if st.button("Try again", key="retry_market"):
+            _clear_data_caches()
+            st.rerun()
+    moves = get_moves(favorites) if favorites else None
+    if snap is not None:
+        bullets, big = market_reading(snap, moves)
+        if big:
+            st.warning("**Big market move today.** One day rarely changes the value of a good business. Before acting, open the Entry and exit plan tab: "
+                       "staged buying exists for days like this. Check that your Quality scores still hold, and read the headlines below for the cause.")
+        st.markdown("**Automatic reading of the numbers** (what moved, not why):")
+        st.markdown("\n".join(f"- {b}" for b in bullets))
+
+        ind = snap["indices"].copy()
+        show = pd.DataFrame({
+            "Market": ind["Name"],
+            "Level": [f"{v:.2f}%" if s == "^TNX" else f"{v:,.2f}" for v, s in zip(ind["Last"], ind["Symbol"])],
+            "Change today": [f"{p * 100:+.0f} basis points" if s == "^TNX" else f"{c:+.2f}%" for p, c, s in zip(ind["Change pts"], ind["Change %"], ind["Symbol"])],
+        })
+        raw = pd.Series([p if s == "^TNX" else c for p, c, s in zip(ind["Change pts"], ind["Change %"], ind["Symbol"])], index=show.index)
+        inv = [i for i, s in zip(show.index, ind["Symbol"]) if s in ("^VIX", "^TNX")]
+        styler = show.style.apply(lambda col_: _colour_col(raw, inv), subset=["Change today"])
+        st.dataframe(styler, hide_index=True, use_container_width=True)
+
+        sec = snap["sectors"].sort_values("Change %")
+        if not sec.empty:
+            st.markdown("**Sectors today** (sector funds)")
+            fig, ax = plt.subplots(figsize=(7, 3.4))
+            ax.barh(sec["Name"], sec["Change %"], color=["#2e9e5b" if v >= 0 else "#d64545" for v in sec["Change %"]])
+            ax.axvline(0, color="gray", linewidth=0.8)
+            ax.set_xlabel("Change today (%)")
+            ax.grid(axis="x", alpha=0.25)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        st.caption(f"Latest daily bar: {snap['asof']}. 'Today' means the latest session in the data.")
+
+    if moves is not None and not moves.empty:
+        st.markdown("**Your favorites: biggest moves**")
+        c1, c2 = st.columns(2)
+        fmt = {"Price": "{:,.2f}", "Change %": "{:+.2f}%"}
+        with c1:
+            st.caption("Biggest drops")
+            st.dataframe(moves.sort_values("Change %").head(5).style.format(fmt), hide_index=True, use_container_width=True)
+        with c2:
+            st.caption("Biggest gains")
+            st.dataframe(moves.sort_values("Change %", ascending=False).head(5).style.format(fmt), hide_index=True, use_container_width=True)
+
+    st.markdown("**Market headlines**")
+    items, ok = get_news("^GSPC", "", "market")
+    if not ok:
+        st.warning("No news source answered right now. Try again in a minute.")
+        if st.button("Try again", key="retry_market_news"):
+            _clear_data_caches()
+            st.rerun()
+    else:
+        render_headlines(items, limit=12, max_age_days=3)
+    st.caption("Headlines come from Google News (links go to the publisher), with Yahoo as a backup. Only titles are shown. "
+               "A headline's explanation can be wrong or incomplete, so use it as a starting point. Not investment advice.")
+
+
+def _last_day_change(df: pd.DataFrame):
+    """% change of the latest price versus the last bar of the previous trading day."""
+    try:
+        s = df["Close"].dropna()
+        days = pd.Series(s.values, index=pd.DatetimeIndex(s.index).normalize())
+        prev = days[days.index < days.index[-1]]
+        if prev.empty:
+            return None
+        return (float(s.iloc[-1]) / float(prev.iloc[-1]) - 1) * 100
+    except Exception:
+        return None
+
+
+def render_news_tab(stock: str, indicator_data: pd.DataFrame):
+    inst = get_instrument_info(stock)
+    name = inst.get("name") or ""
+    kind = "etf" if inst.get("type") in ETF_TYPES else "stock"
+    st.subheader(f"News - {stock}" + (f" ({name})" if name else ""))
+    chg = _last_day_change(indicator_data)
+    sp_c = _snap_change(get_market_snapshot(), "^GSPC")
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"{stock} today", f"{chg:+.2f}%" if chg is not None else "N/A")
+    m2.metric("S&P 500 today", f"{sp_c:+.2f}%" if sp_c is not None else "N/A")
+    m3.metric("Difference", f"{chg - sp_c:+.2f} points" if chg is not None and sp_c is not None else "N/A")
+    if chg is not None and sp_c is not None:
+        if abs(chg) >= 3 and abs(sp_c) < 1:
+            st.info(f"**Stock-specific move.** {stock} moved much more than the market, so the reason is probably company news. Read the headlines below.")
+        elif abs(chg) >= 2 and abs(sp_c) >= 1 and chg * sp_c > 0:
+            extra = chg - sp_c
+            st.info("**Mostly a market-wide move.** " + (f"{stock} moved {abs(extra):.1f} points more than the market, so check the headlines for anything specific." if abs(extra) >= 2
+                                                           else "The stock is moving with the market. See the Market today tab."))
+        elif abs(chg) < 2:
+            st.caption("An ordinary day for this stock (under 2% either way).")
+    if not name:
+        st.caption("Yahoo did not give the company name right now, so the search used the ticker only and may include other companies. Try again later for a cleaner list.")
+    period = st.radio("Show headlines from", ["Last 3 days", "Last 7 days", "Everything found"], index=1, horizontal=True, key="news_period")
+    max_age = {"Last 3 days": 3, "Last 7 days": 7}.get(period)
+    items, ok = get_news(stock, name, kind)
+    if not ok:
+        st.warning("No news source answered right now (Google News and Yahoo both failed). This is usually temporary.")
+        if st.button("Try again", key="retry_news"):
+            _clear_data_caches()
+            st.rerun()
+    else:
+        render_headlines(items, limit=15, max_age_days=max_age)
+    st.caption("Headlines come from Google News (links go to the publisher), with Yahoo as a backup. Only titles are shown; open a link to read the story. "
+               "Searches use the company name, but a headline can still be about a different company with a similar name, so check before acting. "
+               "News is context for your decision, not a buy or sell signal. Not investment advice.")
+
+
 def main():
     st.set_page_config(page_title="Stock Technical Dashboard", layout="wide")
     # Reduce vertical spacing; compact tables
@@ -3497,7 +3977,7 @@ def main():
     st.session_state["val_defaults_for"] = (active_stock, profile_choice)
     st.session_state["val_defaults_for_stock"] = active_stock
 
-    tab_charts, tab_lt, tab_fin, tab_val, tab_plan, tab_analyst, tab_paper, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_fin, tab_val, tab_plan, tab_analyst, tab_news, tab_paper, tab_market, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
         [
             "Price charts",
             "Buy checklist",
@@ -3505,7 +3985,9 @@ def main():
             "Fair value",
             "Entry and exit plan",
             "Analyst view",
+            "News",
             "Test the signals",
+            "Market today",
             "Compare stocks",
             "Top 10 lists",
             "My portfolio",
@@ -3652,6 +4134,9 @@ def main():
                 )
                 st.caption("Yahoo provides about 4 fiscal years, so growth rates cover roughly 3 years.")
 
+    with tab_market:
+        render_market_tab(favorites)
+
     with tab_cmp:
         render_compare_tab(active_stock, st.session_state["favorites"], r_default)
 
@@ -3796,6 +4281,9 @@ def main():
                     f"Each cell is the buy price (fair value x (1 − MoS)) at your r = {r_pct:g}% and MoS = {mos_pct:g}%. "
                     f"Green = current price (${current_price:.1f}) is at or below it; red = above."
                 )
+
+    with tab_news:
+        render_news_tab(active_stock, indicator_data)
 
     with tab_paper:
         st.subheader(f"Test the signals – {active_stock}")
@@ -4050,14 +4538,16 @@ def main():
 | **Fair value** | What could it be worth, and what is the most I should pay? | Setting a buy price from your own assumptions |
 | **Entry and exit plan** | How do I buy in stages and take profit in stages? | Turning the buy price and fair value into a price-by-price plan |
 | **Analyst view** | What do professional analysts think, and is that changing? | A cross-check against your own view |
+| **News** | Why did this stock move, and what is being said about it? | After a big move or an alert, before you act |
 | **Test the signals** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
+| **Market today** | What is the whole market doing today, and what are the headlines? | On a big up or down day, or as a morning check |
 | **Compare stocks** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
 | **Top 10 lists** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your favorites and the wider stock list |
 | **My portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
 | **My favorites** | Shortcuts to the stocks I follow | Saving a search through the dropdown |
 | **How it works** | What does each number mean? | Whenever a metric is unclear (this page) |
 
-The first seven tabs are about the **one stock you loaded**. The next four look **across stocks** or at your own holdings.
+The first eight tabs are about the **one stock you loaded**. The next five look **across stocks** or at your own holdings.
 
 **Suggested workflow**
 1. Pick a ticker in the **Stock ticker** box at the top (or type any symbol and press Enter). Everything loads right away.
@@ -4065,8 +4555,8 @@ The first seven tabs are about the **one stock you loaded**. The next four look 
 3. Open **Business snapshot** to see the business's strengths and watch-outs, then **Fair value** to set your own growth, multiple and margin-of-safety assumptions. Compare the current price with the **Buy price**.
 4. Open **Entry and exit plan** to split your money into tranches and set the prices at which you would sell part of the position.
 5. Use **Price charts** to judge timing, and **Test the signals** to see whether those timing signals have actually worked for this stock.
-6. Cross-check with **Analyst view**.
-7. Use **Compare stocks** to choose between candidates, **Top 10 lists** for new ideas (and alerts on your favorites), and **My portfolio** for profit-taking signals on what you own. Keep the stocks you follow in **My favorites**.
+6. Cross-check with **Analyst view**, and read **News** after any big move.
+7. Use **Market today** to see whether a move is the market or just this stock. Use **Compare stocks** to choose between candidates, **Top 10 lists** for new ideas (and alerts on your favorites), and **My portfolio** for profit-taking signals on what you own. Keep the stocks you follow in **My favorites**.
 
 **Ideal long-term buy:** a high-quality business (Quality), priced below your buy price (Valuation), at a moment when the trend is intact and the price has pulled back (Timing).
 """)
@@ -4077,7 +4567,7 @@ The first seven tabs are about the **one stock you loaded**. The next four look 
 - **Any other stock:** type its Yahoo Finance symbol in the same box (for example BRK-B for Berkshire) and press Enter.
 - **No Load button:** choosing or typing a ticker loads it into every tab straight away. The **Load** button in My favorites fills this same box.
 - **Current price:** the latest close of the most recent 4-hour bar, so it can lag the live price slightly.
-- **Data source:** Yahoo Finance for everything. Prices refresh about every 15 minutes, company statements and valuation history about every hour, so numbers may not change on every click.
+- **Data source:** Yahoo Finance for prices and company data; Google News (with Yahoo as backup) for headlines. Prices refresh about every 15 minutes, company statements and valuation history about every hour, so numbers may not change on every click.
 - **Missing data:** when Yahoo has no value, the app shows N/A and ignores that item when scoring.
 - **Data as of line:** under the top bar, it shows the date of the latest price bar, how often data refreshes, and the date of the last daily scan.
 - **When Yahoo is having a bad moment:** Yahoo sometimes returns nothing (more often on shared cloud servers). The app then shows a yellow notice instead of empty tabs, with a **Try again** button and, when available, the last saved scan result for that stock. A failed lookup is never remembered: the next click asks Yahoo again (with a short pause of about two minutes between automatic retries so Yahoo is not hammered).
@@ -4252,6 +4742,34 @@ The line under the inputs shows the raw historical growth and says when it was c
 **When to stop and re-check** lists the situations in which the plan should be reviewed (for example a drop in Quality or a broken business story) rather than followed mechanically. A CSV download saves the plan.
 
 This is a planning aid built on your own assumptions. It is not investment advice.
+""")
+
+        with st.expander("News tab: why did it move, and what is being said"):
+            st.markdown("""
+**What it helps you do:** find the likely reason behind a move without leaving the app, and see whether the move was about the company or about the whole market.
+
+**The three numbers at the top:** the stock's move versus the previous trading day, the S&P 500's move, and the difference. A note under them says whether the move looks **stock-specific** (the stock moved 3% or more while the market moved less than 1%) or **mostly market-wide**.
+
+**Headlines:** the latest headlines for the company, newest first, with publisher and age. You can show the last 3 days, last 7 days or everything found. Only titles are shown; the link opens the publisher's page.
+
+**Where the headlines come from:** Google News (free, no account needed) is the main source because it kept working when Yahoo was rate-limiting. Yahoo Finance's own news is used as a backup when Google returns very little or fails. Duplicate headlines and generic quote pages are removed. The search uses the company name, which avoids mix-ups for short tickers such as T or F.
+
+**Limits:** a headline can be late, wrong, or about another company with a similar name. News explains moves after the fact; it is context for your decision, not a buy or sell signal. If both sources fail, the tab says so and offers **Try again**.
+""")
+
+        with st.expander("Market today tab: the whole market in one place"):
+            st.markdown("""
+**What it helps you do:** see in a minute what the market is doing and why people say it is moving, before you decide anything about one stock.
+
+**Automatic reading of the numbers:** a few plain sentences built from the data, not written by a person or an AI. They say what moved (indexes, Nasdaq versus Dow, the VIX fear gauge, the 10-year yield, oil and gold, which sectors lead and lag, how far the S&P 500 is from its 200-day average and 52-week high, and how many of your favorites are down). They do not claim to know the cause; the headlines give the reasons.
+
+**Big move warning:** shown when the S&P 500 is down 2% or more, the Nasdaq is down 3% or more, or the VIX is above 30 (or jumped 15% or more in a day). It reminds you that one day rarely changes a good business and points you to the staged-buying plan.
+
+**How to read the VIX and yield:** the VIX under 15 is calm, 15-20 normal, 20-30 nervous, above 30 stress. For the VIX and the yield the colours are reversed, so a rise shows red.
+
+**Tables and chart:** an index table, a sector bar chart (sector funds), and your favorites' biggest drops and gains today. Then up to 12 market headlines from the last 3 days.
+
+**Limits:** prices are Yahoo's daily data and can lag by minutes; "today" means the latest session in the data. If Yahoo does not answer, the tab says so and the headlines may still work.
 """)
 
         with st.expander("Test the signals tab: how the timing rules would have done"):
