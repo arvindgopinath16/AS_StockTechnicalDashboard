@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+
+import ai_assistant
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
@@ -1673,7 +1676,7 @@ def _reset_val_inputs(sugg: dict, r_default: float):
 def _clear_data_caches():
     """Forget cached company data and any recent failures, so the next load asks Yahoo again."""
     for fn in (_fetch_financial_metrics_cached, _fetch_quality_metrics_cached, _fetch_valuation_context_cached, _fetch_analyst_raw,
-               _fetch_news_cached, _fetch_market_snapshot_cached, _fetch_moves_cached):
+               _fetch_news_cached, _fetch_market_snapshot_cached, _fetch_moves_cached, _score_or_raise, _ai_chart_data):
         try:
             fn.clear()
         except Exception:
@@ -3860,6 +3863,481 @@ def render_news_tab(stock: str, indicator_data: pd.DataFrame):
                "News is context for your decision, not a buy or sell signal. Not investment advice.")
 
 
+# ---------------------------------------------------------------------------
+# AI assistant: the fixed menu of tools the model may use (it never runs code), the chart renderer and the chat tab.
+# Connection, limits and the tool loop live in ai_assistant.py.
+# ---------------------------------------------------------------------------
+_SYMBOL_ALIASES = {
+    "S&P 500": "^GSPC", "S&P500": "^GSPC", "S&P": "^GSPC", "SP500": "^GSPC", "SPX": "^GSPC", "NASDAQ": "^IXIC", "NASDAQ COMPOSITE": "^IXIC",
+    "DOW": "^DJI", "DOW JONES": "^DJI", "RUSSELL 2000": "^RUT", "VIX": "^VIX", "GOLD": "GC=F", "OIL": "CL=F", "BITCOIN": "BTC-USD",
+}
+_SYMBOL_RE = re.compile(r"^[A-Z0-9.\-^=]{1,12}$")
+_CHART_DAYS = {"1mo": 31, "3mo": 93, "6mo": 186, "1y": 366, "2y": 731, "5y": 1827, "10y": 3653}
+_TOOL_LABELS = {
+    "get_stock_summary": "Buy checklist", "compare_stocks": "comparison", "get_price_stats": "price statistics", "get_news_headlines": "news",
+    "get_market_today": "market numbers", "get_entry_plan": "entry plan", "get_exit_plan": "exit plan",
+    "get_favorites_overview": "favorites scan", "get_my_portfolio": "your portfolio", "show_chart": "chart", "open_stock": "load stock",
+}
+
+
+def _secret(name: str) -> str:
+    """Read a secret from Streamlit's secrets (Cloud: app Settings > Secrets), falling back to an environment variable for local use."""
+    value = None
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value or os.environ.get(name, "") or "")
+
+
+def _ai_symbol(raw) -> str:
+    t = str(raw or "").strip().upper()
+    t = _SYMBOL_ALIASES.get(t, t)
+    if not _SYMBOL_RE.match(t):
+        raise ValueError(f"'{raw}' is not a valid ticker symbol")
+    return t
+
+
+def _r_default_value() -> float:
+    sp3 = sp500_trailing_return(3)
+    return round(min(sp3 + 2.0, 15.0), 1) if sp3 is not None else 12.0
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _score_or_raise(stock: str, r_default: float) -> dict:
+    """Like score_symbol_cached, but a failed lookup raises so it is never cached."""
+    row = score_symbol(stock, r_default)
+    if row.get("error"):
+        raise RuntimeError(row["error"])
+    return row
+
+
+def _rn(x, d=1):
+    try:
+        if x is None or pd.isna(x):
+            return None
+        return round(float(x), d)
+    except Exception:
+        return None
+
+
+def _ai_row(symbol) -> tuple:
+    sym = _ai_symbol(symbol)
+    r = _r_default_value()
+    return sym, _score_or_raise(sym, r), r
+
+
+def _compact_row(row: dict, r: float) -> dict:
+    return {
+        "symbol": row["symbol"], "name": row["name"], "type": row["type"], "sector": row["sector"], "stock_type": row["stock_type"] or None,
+        "price": _rn(row["price"], 2), "price_date": row["price_date"], "verdict": row["verdict"],
+        "scores_pct": {"quality": _rn(row["quality_pct"], 0), "valuation": _rn(row["valuation_pct"], 0), "timing": _rn(row["timing_pct"], 0)},
+        "checks_scored": {"quality": row["quality_n"], "valuation": row["valuation_n"], "timing": row["timing_n"]},
+        "fair_value_eps10": _rn(row["fair_eps10"], 2), "buy_price_eps10": _rn(row["buy_eps10"], 2),
+        "fair_value_dcf": _rn(row["fair_dcf"], 2), "buy_price_dcf": _rn(row["buy_dcf"], 2),
+        "avg_upside_to_fair_pct": _rn(row["upside_pct"]), "buy_zone": row["buy_zone"] or "not in zone",
+        "price_vs_buy_price_pct": _rn(row["buy_gap_pct"]), "overbought_signals_of_3": row["sell_signals"], "rsi_daily": _rn(row["rsi_daily"]),
+        "trim_level": row["trim_level"], "trim_reason": row["trim_reason"],
+        "assumptions": {"growth_pct": _rn(row["g_pct"]), "exit_multiple": _rn(row["k"]), "margin_of_safety_pct": _rn(row["mos_pct"]), "required_return_pct": r},
+        "ranked_in_top10_lists": bool(row["eligible"]),
+    }
+
+
+def _ai_price_stats(symbol) -> dict:
+    sym = _ai_symbol(symbol)
+    daily = download_daily(sym, years=2)
+    if daily is None or daily.empty:
+        raise ValueError("no price history")
+    close = normalize_ohlcv_columns(daily)["Close"].astype(float).dropna()
+    close.index = pd.to_datetime(close.index).tz_localize(None) if getattr(close.index, "tz", None) is not None else pd.to_datetime(close.index)
+    last = float(close.iloc[-1])
+
+    def back(n):
+        return _rn((last / float(close.iloc[-1 - n]) - 1) * 100) if len(close) > n else None
+
+    prev_year = close[close.index.year < close.index[-1].year]
+    ytd = _rn((last / float(prev_year.iloc[-1]) - 1) * 100) if not prev_year.empty else None
+    hi, lo = float(close.tail(252).max()), float(close.tail(252).min())
+    out = {"symbol": sym, "price": _rn(last, 2), "date": str(close.index[-1].date()),
+           "change_pct": {"1d": back(1), "1w": back(5), "1m": back(21), "3m": back(63), "6m": back(126), "1y": back(252), "ytd": ytd},
+           "high_52w": _rn(hi, 2), "low_52w": _rn(lo, 2), "pct_from_52w_high": _rn((last / hi - 1) * 100)}
+    if len(close) >= 50:
+        out["pct_vs_50d_avg"] = _rn((last / float(close.tail(50).mean()) - 1) * 100)
+    if len(close) >= 200:
+        out["pct_vs_200d_avg"] = _rn((last / float(close.tail(200).mean()) - 1) * 100)
+    return out
+
+
+def _ai_news(symbol) -> dict:
+    s = str(symbol or "").strip().upper()
+    if s in ("MARKET", "STOCK MARKET", "THE MARKET"):
+        sym, items, ok = "MARKET", *get_news("^GSPC", "", "market")
+    else:
+        sym = _ai_symbol(s)
+        inst = get_instrument_info(sym)
+        items, ok = get_news(sym, inst.get("name") or "", "etf" if inst.get("type") in ETF_TYPES else "stock")
+    if not ok:
+        raise RuntimeError("no news source answered right now")
+    now = datetime.now(timezone.utc)
+    recent = [i for i in items if not i.get("published") or (now - i["published"]).days < 7][:8]
+    return {"symbol": sym, "headlines": [{"title": i["title"], "source": i["source"], "age": _news_ago(i.get("published"))} for i in recent]}
+
+
+def _ai_market(favorites: list) -> dict:
+    snap = get_market_snapshot()
+    if snap is None:
+        raise RuntimeError("market prices are not available from Yahoo right now")
+    moves = get_moves(favorites) if favorites else None
+    bullets, big = market_reading(snap, moves)
+    ind = snap["indices"]
+    return {
+        "as_of": snap["asof"], "big_move_today": big, "reading": bullets,
+        "indices": [{"name": r["Name"], "level": _rn(r["Last"], 2), "change_pct": _rn(r["Change %"], 2),
+                     **({"change_basis_points": _rn(r["Change pts"] * 100, 0)} if r["Symbol"] == "^TNX" else {})} for _, r in ind.iterrows()],
+        "sectors": [{"name": r["Name"], "change_pct": _rn(r["Change %"], 2)} for _, r in snap["sectors"].sort_values("Change %").iterrows()],
+    }
+
+
+def _ai_entry_plan(symbol, total_amount, tranches=3, style="value", step_pct=7.5) -> dict:
+    sym, row, _ = _ai_row(symbol)
+    price = float(row["price"])
+    buy = row["buy_eps10"] or row["buy_dcf"]
+    total = float(total_amount)
+    if total <= 0:
+        raise ValueError("total_amount must be above zero")
+    n = int(max(2, min(6, int(tranches or 3))))
+    step = float(max(1.0, min(25.0, float(step_pct or 7.5))))
+    note = ""
+    if str(style).lower() == "value" and buy and buy > 0:
+        anchor, used = float(buy), "value (starts at the model buy price)"
+    else:
+        anchor, used = price, "pullback (starts at today's price)"
+        if str(style).lower() == "value":
+            note = "No model buy price for this stock, so the ladder starts at today's price."
+    rows = build_entry_ladder(anchor, n, step, total, price)
+    out = {"symbol": sym, "current_price": _rn(price, 2), "style": used, "step_pct": step, "note": note, "quality_pct": _rn(row["quality_pct"], 0),
+           "tranches": [{"tranche": r["Tranche"], "buy_at_or_below": _rn(r["Buy at or below"], 2), "distance_from_today_pct": _rn(r["Distance from today %"]),
+                         "amount": _rn(r["Amount"], 2), "approx_shares": _rn(r["Shares"], 2), "status": r["Status"]} for r in rows]}
+    if row["quality_pct"] is not None and row["quality_pct"] < 50:
+        out["warning"] = "Quality is below 50%, so staged buying only averages down into a weaker business. Re-check the business first."
+    return out
+
+
+def _ai_exit_plan(symbol, shares=None, avg_cost=None) -> dict:
+    sym, row, _ = _ai_row(symbol)
+    price = float(row["price"])
+    shares = float(shares or 0)
+    avg_cost = float(avg_cost or 0)
+    fair = row["fair_eps10"] or row["fair_dcf"]
+    if avg_cost > 0:
+        base, levels, basis = avg_cost, [30, 60, 100], "your average cost (steps are percent above cost)"
+    elif fair and fair > 0:
+        base, levels, basis = float(fair), [0, 20, 40], "the model fair value (steps are percent above fair value)"
+    else:
+        raise ValueError("no model fair value for this stock and no average cost was given")
+    rows = build_exit_ladder(base, levels, [10, 15, 25], price, shares, avg_cost)
+    return {"symbol": sym, "current_price": _rn(price, 2), "based_on": basis, "overbought_signals_of_3": row["sell_signals"], "trim_level": row["trim_level"],
+            "steps": [{"step": r["Step"], "sell_when_price_reaches": _rn(r["Sell when price reaches"], 2), "distance_from_today_pct": _rn(r["Distance from today %"]),
+                       "sell_pct_of_position": r["Sell % of position"], "shares_to_sell": _rn(r["Shares to sell"], 2), "cash_received": _rn(r["Cash received"], 2),
+                       "gain_locked_in": _rn(r["Gain locked in"], 2), "status": r["Status"]} for r in rows]}
+
+
+def _ai_favorites(favorites: list) -> dict:
+    df, state = load_rankings()
+    if df is None or df.empty:
+        raise RuntimeError("no daily scan results are saved yet")
+    fav = set(favorites)
+    f = df[df["symbol"].isin(fav)]
+
+    def pack(d, cols):
+        return [{c: (_rn(r[c], 1) if isinstance(r[c], float) else r[c]) for c in cols} for _, r in d.iterrows()]
+
+    buy, avoid = rank_results(df)
+    return {
+        "scan_date": state.get("asof"), "favorites_scanned": int(len(f)),
+        "in_buy_zone": pack(f[f["buy_zone"] == "In zone"], ["symbol", "price", "buy_eps10", "buy_gap_pct", "quality_pct", "verdict_short"]),
+        "near_buy_zone": pack(f[f["buy_zone"] == "Near"], ["symbol", "price", "buy_eps10", "buy_gap_pct", "quality_pct", "verdict_short"]),
+        "trim_or_review": pack(f[f["trim_level"].isin(["Trim", "Review"])], ["symbol", "trim_level", "trim_reason", "quality_pct"]),
+        "top10_buy": [{"symbol": r["symbol"], "quality": _rn(r["quality_pct"], 0), "valuation": _rn(r["valuation_pct"], 0), "timing": _rn(r["timing_pct"], 0),
+                       "favorite": r["symbol"] in fav} for _, r in buy.iterrows()],
+        "top10_avoid": [{"symbol": r["symbol"], "quality": _rn(r["quality_pct"], 0), "valuation": _rn(r["valuation_pct"], 0), "favorite": r["symbol"] in fav}
+                        for _, r in avoid.iterrows()],
+    }
+
+
+def _ai_portfolio() -> dict:
+    if not st.session_state.get("ai_share_portfolio"):
+        raise PermissionError("the user has not chosen to share their portfolio with the assistant")
+    pf = st.session_state.get("pf_base")
+    if pf is None or pf.empty:
+        raise ValueError("the My portfolio tab has no positions entered yet")
+    out = []
+    for _, r in pf.dropna(subset=["Symbol"]).head(15).iterrows():
+        sym = str(r["Symbol"]).strip().upper()
+        shares, cost = float(r.get("Shares") or 0), float(r.get("Avg cost") or 0)
+        try:
+            px = _ai_price_stats(sym)["price"]
+        except Exception:
+            px = None
+        out.append({"symbol": sym, "shares": shares, "avg_cost": cost, "price": px,
+                    "gain_pct": _rn((px / cost - 1) * 100) if px and cost else None, "value": _rn(px * shares, 2) if px else None})
+    total = sum(x["value"] or 0 for x in out)
+    for x in out:
+        x["weight_pct"] = _rn((x["value"] or 0) / total * 100) if total else None
+    return {"positions": out, "total_value": _rn(total, 2)}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _ai_chart_data(symbols: tuple, days: int) -> pd.DataFrame:
+    return _download_closes(list(symbols), days + 320)
+
+
+def _chart_window(spec: dict, close: pd.DataFrame) -> pd.DataFrame:
+    start = close.index[-1] - pd.Timedelta(days=spec["days"])
+    return close[close.index >= start]
+
+
+def _ai_show_chart(ctx: dict, symbols, period="1y", mode=None) -> dict:
+    syms = []
+    for s in list(symbols or [])[:4]:
+        t = _ai_symbol(s)
+        if t not in syms:
+            syms.append(t)
+    if not syms:
+        raise ValueError("no symbols given")
+    period = period if period in _CHART_DAYS or period == "ytd" else "1y"
+    days = (datetime.now() - datetime(datetime.now().year, 1, 1)).days + 2 if period == "ytd" else _CHART_DAYS[period]
+    mode = mode if mode in ("price", "compare", "drawdown") else ("price" if len(syms) == 1 else "compare")
+    if mode == "price" and len(syms) > 1:
+        mode = "compare"
+    spec = {"symbols": syms, "period": period, "days": days, "mode": mode}
+    close = _ai_chart_data(tuple(syms), days)
+    win = _chart_window(spec, close)
+    rets, missing = {}, []
+    for s in syms:
+        if s in win.columns and win[s].dropna().shape[0] >= 2:
+            col = win[s].dropna()
+            rets[s] = _rn((float(col.iloc[-1]) / float(col.iloc[0]) - 1) * 100)
+        else:
+            missing.append(s)
+    if not rets:
+        raise ValueError("Yahoo returned no price history for those symbols")
+    spec["symbols"] = [s for s in syms if s in rets]
+    ctx["charts"].append(spec)
+    return {"ok": True, "mode": mode, "period": period, "total_return_pct_over_period": rets, "no_data_for": missing,
+            "note": "The chart is displayed to the user below your answer."}
+
+
+def render_ai_chart(spec: dict):
+    try:
+        close = _ai_chart_data(tuple(spec["symbols"]), spec["days"])
+    except Exception:
+        st.caption("Chart data is not available right now.")
+        return
+    win = _chart_window(spec, close)
+    if any(sym not in win.columns or win[sym].dropna().shape[0] < 2 for sym in spec["symbols"]):
+        st.caption("Chart data is not available for one of those symbols right now.")
+        return
+    fig, ax = plt.subplots(figsize=(7.5, 3.6))
+    mode = spec["mode"]
+    if mode == "price":
+        s = spec["symbols"][0]
+        full = close[s].dropna()
+        w = win[s].dropna()
+        ax.plot(w.index, w.values, color="#1f77b4", linewidth=1.6, label=s)
+        for n_, col_ in ((50, "#ff7f0e"), (200, "#7f7f7f")):
+            ma = full.rolling(n_).mean()
+            ma = ma[ma.index >= w.index[0]]
+            if not ma.dropna().empty:
+                ax.plot(ma.index, ma.values, color=col_, linewidth=1.0, linestyle="--", label=f"{n_}-day average")
+        ax.set_ylabel("Price")
+        ax.set_title(f"{s} - {spec['period']}")
+    elif mode == "drawdown":
+        for s in spec["symbols"]:
+            w = win[s].dropna()
+            if len(w) > 1:
+                ax.plot(w.index, (w / w.cummax() - 1) * 100, linewidth=1.4, label=s)
+        ax.set_ylabel("% below the running high")
+        ax.set_title(f"Fall from the high - {spec['period']}")
+    else:
+        for s in spec["symbols"]:
+            w = win[s].dropna()
+            if len(w) > 1:
+                ax.plot(w.index, w / float(w.iloc[0]) * 100, linewidth=1.5, label=s)
+        ax.axhline(100, color="gray", linewidth=0.8)
+        ax.set_ylabel("Start = 100")
+        ax.set_title(f"Performance compared - {spec['period']}")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _build_ai_tools(ctx: dict, favorites: list) -> dict:
+    def summary(symbol):
+        sym, row, r = _ai_row(symbol)
+        return _compact_row(row, r)
+
+    def compare(symbols):
+        out = []
+        for s in list(symbols or [])[:4]:
+            try:
+                out.append(summary(s))
+            except Exception as exc:
+                out.append({"symbol": str(s), "error": str(exc)[:120]})
+        return {"stocks": out}
+
+    def open_stock(symbol):
+        sym = _ai_symbol(symbol)
+        ctx["actions"].append({"type": "open_stock", "symbol": sym})
+        return {"ok": True, "note": f"{sym} will be loaded in the dashboard's other tabs."}
+
+    return {
+        "get_stock_summary": summary, "compare_stocks": compare, "get_price_stats": _ai_price_stats, "get_news_headlines": _ai_news,
+        "get_market_today": lambda: _ai_market(favorites), "get_entry_plan": _ai_entry_plan, "get_exit_plan": _ai_exit_plan,
+        "get_favorites_overview": lambda: _ai_favorites(favorites), "get_my_portfolio": _ai_portfolio,
+        "show_chart": lambda symbols, period="1y", mode=None: _ai_show_chart(ctx, symbols, period, mode), "open_stock": open_stock,
+    }
+
+
+def _tools_used_text(tools: list) -> str:
+    seen = []
+    for t in tools:
+        label = _TOOL_LABELS.get(t["tool"], t["tool"])
+        a = t.get("args") or {}
+        who = a.get("symbol") or ", ".join(map(str, a.get("symbols") or []))
+        item = f"{label} ({who})" if who else label
+        if item not in seen:
+            seen.append(item)
+    return ", ".join(seen)
+
+
+def _render_ai_setup(has_key: bool, has_code: bool):
+    st.info("The AI assistant is switched off until two private settings are added. This keeps strangers from using up your free AI quota, because this app's web address is public.")
+    st.markdown(
+        "**One-time setup (about 5 minutes)**\n"
+        "1. Go to **aistudio.google.com**, sign in with a Google account, click **Get API key**, and create a key (free, no card).\n"
+        "2. In Streamlit Cloud open your app, then **Settings > Secrets**, and paste these two lines (put your own key and a code of your choice inside the quotes):\n"
+    )
+    st.code('GEMINI_API_KEY = "paste-your-key-here"\nAI_ACCESS_CODE = "choose-a-code-only-you-know"', language="toml")
+    st.markdown(
+        "3. Save. The app restarts, and this tab will ask for your access code.\n\n"
+        f"Status: API key {'found' if has_key else 'missing'}; access code {'found' if has_code else 'missing'}.\n\n"
+        "Never type the key into any file that you upload to GitHub. On your own computer you can instead set the same two names as environment variables."
+    )
+
+
+def render_ai_tab(active_stock: str, favorites: list):
+    st.subheader("AI assistant")
+    key, code = _secret("GEMINI_API_KEY"), _secret("AI_ACCESS_CODE")
+    if not key or not code:
+        _render_ai_setup(bool(key), bool(code))
+        return
+    if not st.session_state.get("ai_unlocked"):
+        with st.form("ai_unlock"):
+            pw = st.text_input("Access code", type="password")
+            go = st.form_submit_button("Unlock")
+        if go:
+            ok, msg = ai_assistant.check_access_code(pw, code)
+            if ok:
+                st.session_state["ai_unlocked"] = True
+                st.rerun()
+            else:
+                st.error(msg)
+        st.caption("Ask about a stock, the market, an entry or exit plan, or request a chart. The code keeps strangers away from your AI quota.")
+        return
+
+    st.session_state.setdefault("ai_msgs", [])
+    st.session_state.setdefault("ai_hist", [])
+    st.session_state.setdefault("ai_count", 0)
+    left = ai_assistant.MAX_MESSAGES_PER_SESSION - st.session_state["ai_count"]
+
+    st.caption("Ask in your own words. The assistant answers using this dashboard's own numbers (it looks them up, it does not guess). "
+               "It can compare stocks, summarize news, build entry and exit plans, draw charts, and load a stock into the other tabs. Not investment advice.")
+    top = st.columns([3, 1])
+    with top[0]:
+        st.checkbox("Let the assistant see my portfolio (shares and cost from the My portfolio tab)", key="ai_share_portfolio",
+                    help="Off by default. Free-tier Google AI may keep and review prompts, so share holdings only if you are comfortable with that.")
+    with top[1]:
+        if st.button("Clear chat", key="ai_clear"):
+            st.session_state["ai_msgs"], st.session_state["ai_hist"] = [], []
+            st.rerun()
+
+    stock = active_stock or "AAPL"
+    quick = {
+        f"Explain {stock}": f"Explain {stock} to me in plain English: is it a good business, is the price attractive, and what does the Buy checklist say?",
+        "Why is the market moving?": "What is happening in the market today, and what do the headlines say about why?",
+        f"{stock} news": f"Summarize the latest news for {stock} and tell me if anything looks important.",
+        f"Entry plan for {stock}": f"Build a 3-tranche entry plan for {stock} for 10000 dollars.",
+        f"Chart {stock} vs S&P 500": f"Show {stock} against the S&P 500 for the last year.",
+        "My favorites": "Which of my favorites look most interesting right now, and why?",
+    }
+    qcols = st.columns(len(quick))
+    clicked = None
+    for col, (label, text) in zip(qcols, quick.items()):
+        if col.button(label, key=f"ai_q_{label}", use_container_width=True):
+            clicked = text
+
+    def show_message(m):
+        with st.chat_message(m["role"]):
+            st.markdown(m["text"].replace("$", "\\$"))
+            for spec in m.get("charts", []):
+                render_ai_chart(spec)
+            if m.get("tools"):
+                st.caption("Looked up: " + m["tools"])
+
+    for m in st.session_state["ai_msgs"]:
+        show_message(m)
+
+    typed = st.chat_input("Ask about a stock, the market, a plan, or a chart...", key="ai_input")
+    prompt = clicked or typed
+    st.caption(f"Messages left in this session: {max(left, 0)}")
+    if not prompt:
+        with st.expander("Check the AI connection"):
+            if st.button("Run a quick test", key="ai_test"):
+                try:
+                    ai_assistant._generate(ai_assistant.gemini_transport(key), {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word OK."}]}],
+                                                                              "generationConfig": {"maxOutputTokens": 20}})
+                    st.success(f"Connected. Model in use: {ai_assistant._good_model['name']}.")
+                except ai_assistant.AIError as exc:
+                    st.error(exc.message)
+            st.caption(f"Calls used today across the whole app: {ai_assistant.DAILY_CALL_CAP - ai_assistant.budget_left()} of {ai_assistant.DAILY_CALL_CAP} allowed.")
+        return
+    if left <= 0:
+        st.warning("You have reached the message limit for this session. Click Clear chat or reload the page to start again.")
+        return
+    prompt = prompt.strip()[: ai_assistant.MAX_INPUT_CHARS]
+    st.session_state["ai_count"] += 1
+    user_m = {"role": "user", "text": prompt}
+    show_message(user_m)
+    ctx = {"charts": [], "actions": []}
+    try:
+        with st.chat_message("assistant"):
+            with st.spinner("Looking things up..."):
+                result = ai_assistant.chat_turn(
+                    ai_assistant.gemini_transport(key),
+                    ai_assistant.build_system_prompt(active_stock, datetime.now().strftime("%A %Y-%m-%d"), bool(st.session_state.get("ai_share_portfolio"))),
+                    st.session_state["ai_hist"], prompt, ai_assistant.TOOL_DECLS, _build_ai_tools(ctx, favorites),
+                )
+            st.markdown(result["text"].replace("$", "\\$"))
+            for spec in ctx["charts"]:
+                render_ai_chart(spec)
+            tools_txt = _tools_used_text(result["tools"])
+            if tools_txt:
+                st.caption("Looked up: " + tools_txt)
+    except ai_assistant.AIError as exc:
+        st.error(exc.message)
+        return
+    st.session_state["ai_hist"] = result["history"]
+    st.session_state["ai_msgs"] += [user_m, {"role": "assistant", "text": result["text"], "charts": ctx["charts"], "tools": tools_txt}]
+    opens = [a for a in ctx["actions"] if a.get("type") == "open_stock"]
+    if opens:
+        st.session_state["pending_ticker"] = opens[-1]["symbol"]
+        st.rerun()
+
+
 def main():
     st.set_page_config(page_title="Stock Technical Dashboard", layout="wide")
     # Reduce vertical spacing; compact tables
@@ -3977,7 +4455,7 @@ def main():
     st.session_state["val_defaults_for"] = (active_stock, profile_choice)
     st.session_state["val_defaults_for_stock"] = active_stock
 
-    tab_charts, tab_lt, tab_fin, tab_val, tab_plan, tab_analyst, tab_news, tab_paper, tab_market, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
+    tab_charts, tab_lt, tab_fin, tab_val, tab_plan, tab_analyst, tab_news, tab_paper, tab_market, tab_ai, tab_cmp, tab_rank, tab_port, tab_fav, tab_explain = st.tabs(
         [
             "Price charts",
             "Buy checklist",
@@ -3988,6 +4466,7 @@ def main():
             "News",
             "Test the signals",
             "Market today",
+            "AI assistant",
             "Compare stocks",
             "Top 10 lists",
             "My portfolio",
@@ -4136,6 +4615,9 @@ def main():
 
     with tab_market:
         render_market_tab(favorites)
+
+    with tab_ai:
+        render_ai_tab(active_stock, favorites)
 
     with tab_cmp:
         render_compare_tab(active_stock, st.session_state["favorites"], r_default)
@@ -4541,13 +5023,14 @@ def main():
 | **News** | Why did this stock move, and what is being said about it? | After a big move or an alert, before you act |
 | **Test the signals** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
 | **Market today** | What is the whole market doing today, and what are the headlines? | On a big up or down day, or as a morning check |
+| **AI assistant** | Can I just ask in plain words? | Questions, comparisons, plans and charts without clicking through tabs |
 | **Compare stocks** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
 | **Top 10 lists** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your favorites and the wider stock list |
 | **My portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
 | **My favorites** | Shortcuts to the stocks I follow | Saving a search through the dropdown |
 | **How it works** | What does each number mean? | Whenever a metric is unclear (this page) |
 
-The first eight tabs are about the **one stock you loaded**. The next five look **across stocks** or at your own holdings.
+The first eight tabs are about the **one stock you loaded**. The next six look **across stocks** or at your own holdings.
 
 **Suggested workflow**
 1. Pick a ticker in the **Stock ticker** box at the top (or type any symbol and press Enter). Everything loads right away.
@@ -4770,6 +5253,19 @@ This is a planning aid built on your own assumptions. It is not investment advic
 **Tables and chart:** an index table, a sector bar chart (sector funds), and your favorites' biggest drops and gains today. Then up to 12 market headlines from the last 3 days.
 
 **Limits:** prices are Yahoo's daily data and can lag by minutes; "today" means the latest session in the data. If Yahoo does not answer, the tab says so and the headlines may still work.
+""")
+
+        with st.expander("AI assistant tab: ask in plain words"):
+            st.markdown("""
+**What it helps you do:** ask a question in your own words instead of clicking through tabs: "Explain MSFT", "Why is the market down?", "Compare NVDA and AMD", "Build a 4-step entry plan for 5000 dollars", "Show UAL vs DAL for 2 years", "Which of my favorites are near their buy price?". The one-click buttons above the chat ask common questions for you.
+
+**How it works:** the assistant is Google's Gemini model, but it does not guess numbers. It can only use a fixed menu of this dashboard's own functions: the Buy checklist scores, fair value and buy price, price statistics, news headlines, today's market numbers, the entry and exit ladders, your favorites scan, and chart drawing. Under each answer, **Looked up** shows which functions were used, so you can see where the numbers came from. It also knows this app's definitions (Quality, Valuation, Timing, buy zone, Trim and so on).
+
+**What it cannot do:** it cannot trade, cannot see your accounts, cannot read your GitHub files, and does not run code. It does not see your portfolio unless you tick **Let the assistant see my portfolio**.
+
+**Privacy:** your questions and the data it looks up are sent to Google. On the free tier, Google may keep and review prompts, so share your holdings only if you are comfortable with that. Your API key and access code live in Streamlit's secrets, not in the repository.
+
+**Limits and safety:** it asks for an access code (the app's web address is public, and the free AI quota is limited). Each session allows 30 messages, and the app as a whole is capped at 400 AI calls a day. If the free quota runs out you will see a clear message. An AI can misread numbers or phrase things too confidently, so treat answers as a starting point and check the tab it points to. Not investment advice.
 """)
 
         with st.expander("Test the signals tab: how the timing rules would have done"):

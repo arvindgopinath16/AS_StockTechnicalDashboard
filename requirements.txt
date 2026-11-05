@@ -4,3 +4,4 @@ pandas
 ta
 matplotlib
 python-docx
+requests
