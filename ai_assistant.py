@@ -134,7 +134,7 @@ def _generate(send, payload: dict, models=GEMINI_MODELS) -> dict:
         order.remove(_good_model["name"])
         order.insert(0, _good_model["name"])
     if budget_left() <= 0:
-        raise AIError("rate", "The assistant's daily limit for this app has been reached. It resets at midnight Pacific time.")
+        raise AIError("rate", "Charlie's daily limit for this app has been reached. It resets at midnight Pacific time.")
     last = None
     for m in order:
         for attempt in range(2):
@@ -243,12 +243,12 @@ ABOUT THE APP (use these definitions when explaining; they are how THIS dashboar
   or above the user's average cost.
 - Top 10 lists come from a daily scan of the user's favorites and a wider stock list. Rankings are relative, not absolute.
 - Tabs: Price charts, Buy checklist, Business snapshot, Fair value, Entry and exit plan, Analyst view, News, Test the signals, Market today,
-  AI assistant, Compare stocks, Top 10 lists, My portfolio, My favorites, How it works.
+  Ask Charlie (this chat), Compare stocks, Top 10 lists, My portfolio, My favorites, How it works.
 """.strip()
 
 
 def build_system_prompt(active_stock: str, today: str, share_portfolio: bool) -> str:
-    return f"""You are the assistant inside a personal stock dashboard. The user is a retail long-term investor, not a developer or a finance professional.
+    return f"""You are Charlie, the assistant inside a personal stock dashboard. You are named in tribute to Charlie Munger, but you are an AI: never claim to be him, never speak as him, and never invent quotes or opinions and attribute them to him. The user is a retail long-term investor, not a developer or a finance professional.
 
 RULES
 1. Plain language, short answers (usually under 180 words), simple bullets when useful. Define any jargon in a few words.

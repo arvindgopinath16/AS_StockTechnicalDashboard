@@ -3864,7 +3864,7 @@ def render_news_tab(stock: str, indicator_data: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# AI assistant: the fixed menu of tools the model may use (it never runs code), the chart renderer and the chat tab.
+# Ask Charlie (the AI assistant): the fixed menu of tools the model may use (it never runs code), the chart renderer and the chat tab.
 # Connection, limits and the tool loop live in ai_assistant.py.
 # ---------------------------------------------------------------------------
 _SYMBOL_ALIASES = {
@@ -4067,7 +4067,7 @@ def _ai_favorites(favorites: list) -> dict:
 
 def _ai_portfolio() -> dict:
     if not st.session_state.get("ai_share_portfolio"):
-        raise PermissionError("the user has not chosen to share their portfolio with the assistant")
+        raise PermissionError("the user has not chosen to share their portfolio with Charlie")
     pf = st.session_state.get("pf_base")
     if pf is None or pf.empty:
         raise ValueError("the My portfolio tab has no positions entered yet")
@@ -4215,7 +4215,7 @@ def _tools_used_text(tools: list) -> str:
 
 
 def _render_ai_setup(has_key: bool, has_code: bool):
-    st.info("The AI assistant is switched off until two private settings are added. This keeps strangers from using up your free AI quota, because this app's web address is public.")
+    st.info("Ask Charlie is switched off until two private settings are added. This keeps strangers from using up your free AI quota, because this app's web address is public.")
     st.markdown(
         "**One-time setup (about 5 minutes)**\n"
         "1. Go to **aistudio.google.com**, sign in with a Google account, click **Get API key**, and create a key (free, no card).\n"
@@ -4230,7 +4230,8 @@ def _render_ai_setup(has_key: bool, has_code: bool):
 
 
 def render_ai_tab(active_stock: str, favorites: list):
-    st.subheader("AI assistant")
+    st.subheader("Ask Charlie")
+    st.caption("Named in honor of Charlie Munger. This is an AI that looks up your dashboard's own numbers; it is not him and does not speak for him.")
     key, code = _secret("GEMINI_API_KEY"), _secret("AI_ACCESS_CODE")
     if not key or not code:
         _render_ai_setup(bool(key), bool(code))
@@ -4254,11 +4255,11 @@ def render_ai_tab(active_stock: str, favorites: list):
     st.session_state.setdefault("ai_count", 0)
     left = ai_assistant.MAX_MESSAGES_PER_SESSION - st.session_state["ai_count"]
 
-    st.caption("Ask in your own words. The assistant answers using this dashboard's own numbers (it looks them up, it does not guess). "
+    st.caption("Ask in your own words. Charlie answers using this dashboard's own numbers (it looks them up, it does not guess). "
                "It can compare stocks, summarize news, build entry and exit plans, draw charts, and load a stock into the other tabs. Not investment advice.")
     top = st.columns([3, 1])
     with top[0]:
-        st.checkbox("Let the assistant see my portfolio (shares and cost from the My portfolio tab)", key="ai_share_portfolio",
+        st.checkbox("Let Charlie see my portfolio (shares and cost from the My portfolio tab)", key="ai_share_portfolio",
                     help="Off by default. Free-tier Google AI may keep and review prompts, so share holdings only if you are comfortable with that.")
     with top[1]:
         if st.button("Clear chat", key="ai_clear"):
@@ -4466,7 +4467,7 @@ def main():
             "News",
             "Test the signals",
             "Market today",
-            "AI assistant",
+            "Ask Charlie",
             "Compare stocks",
             "Top 10 lists",
             "My portfolio",
@@ -5023,7 +5024,7 @@ def main():
 | **News** | Why did this stock move, and what is being said about it? | After a big move or an alert, before you act |
 | **Test the signals** | Would the app's technical buy and sell rules have made money on this stock? | Testing the timing rules before trusting them |
 | **Market today** | What is the whole market doing today, and what are the headlines? | On a big up or down day, or as a morning check |
-| **AI assistant** | Can I just ask in plain words? | Questions, comparisons, plans and charts without clicking through tabs |
+| **Ask Charlie** | Can I just ask in plain words? | Questions, comparisons, plans and charts without clicking through tabs |
 | **Compare stocks** | Which of these 2-4 stocks is the better choice? | Choosing between similar stocks, or checking a candidate against something you own |
 | **Top 10 lists** | Which stocks look best to buy, or most overvalued, right now? | Finding ideas across your favorites and the wider stock list |
 | **My portfolio** | Which of my positions are worth taking profit on? | After you enter your shares and cost basis |
@@ -5255,13 +5256,13 @@ This is a planning aid built on your own assumptions. It is not investment advic
 **Limits:** prices are Yahoo's daily data and can lag by minutes; "today" means the latest session in the data. If Yahoo does not answer, the tab says so and the headlines may still work.
 """)
 
-        with st.expander("AI assistant tab: ask in plain words"):
+        with st.expander("Ask Charlie tab: ask in plain words"):
             st.markdown("""
 **What it helps you do:** ask a question in your own words instead of clicking through tabs: "Explain MSFT", "Why is the market down?", "Compare NVDA and AMD", "Build a 4-step entry plan for 5000 dollars", "Show UAL vs DAL for 2 years", "Which of my favorites are near their buy price?". The one-click buttons above the chat ask common questions for you.
 
-**How it works:** the assistant is Google's Gemini model, but it does not guess numbers. It can only use a fixed menu of this dashboard's own functions: the Buy checklist scores, fair value and buy price, price statistics, news headlines, today's market numbers, the entry and exit ladders, your favorites scan, and chart drawing. Under each answer, **Looked up** shows which functions were used, so you can see where the numbers came from. It also knows this app's definitions (Quality, Valuation, Timing, buy zone, Trim and so on).
+**How it works:** Charlie is named in honor of Charlie Munger, but it is an AI (Google's Gemini model), not him, and it does not speak for him or quote him. It does not guess numbers. It can only use a fixed menu of this dashboard's own functions: the Buy checklist scores, fair value and buy price, price statistics, news headlines, today's market numbers, the entry and exit ladders, your favorites scan, and chart drawing. Under each answer, **Looked up** shows which functions were used, so you can see where the numbers came from. It also knows this app's definitions (Quality, Valuation, Timing, buy zone, Trim and so on).
 
-**What it cannot do:** it cannot trade, cannot see your accounts, cannot read your GitHub files, and does not run code. It does not see your portfolio unless you tick **Let the assistant see my portfolio**.
+**What it cannot do:** it cannot trade, cannot see your accounts, cannot read your GitHub files, and does not run code. It does not see your portfolio unless you tick **Let Charlie see my portfolio**.
 
 **Privacy:** your questions and the data it looks up are sent to Google. On the free tier, Google may keep and review prompts, so share your holdings only if you are comfortable with that. Your API key and access code live in Streamlit's secrets, not in the repository.
 
