@@ -1,5 +1,5 @@
 {
-  "asof": "2026-11-12 02:41 UTC",
+  "asof": "2026-11-13 02:19 UTC",
   "universe": 538,
   "scored": 519,
   "r_default": 15.0,
@@ -9,36 +9,44 @@
     "INTU",
     "MU",
     "INCY",
-    "PGR",
     "ADBE",
-    "TSM",
     "MELI",
-    "XYL"
+    "NVDA",
+    "TSM",
+    "BKNG"
   ],
   "top_avoid": [
-    "RVTY",
-    "TSN",
     "TTWO",
-    "PSA",
-    "RHI",
+    "DOW",
     "CRWD",
-    "STLD",
-    "SWK",
-    "PSX",
-    "VLO"
+    "VTRS",
+    "BAX",
+    "AEE",
+    "MOS",
+    "CPT",
+    "CRL",
+    "DD"
   ],
-  "trim": [],
+  "trim": [
+    "HAS"
+  ],
   "new_buy": [
-    "PGR",
-    "MELI"
+    "NVDA",
+    "BKNG"
   ],
   "new_avoid": [
-    "TTWO",
-    "STLD",
-    "PSX",
-    "VLO"
+    "DOW",
+    "VTRS",
+    "BAX",
+    "AEE",
+    "MOS",
+    "CPT",
+    "CRL",
+    "DD"
   ],
-  "new_trim": [],
+  "new_trim": [
+    "HAS"
+  ],
   "buy_zone": [
     "NVDA",
     "TSM",
@@ -55,7 +63,6 @@
     "DECK",
     "FSLR",
     "INCY",
-    "PGR",
     "PTC",
     "SMCI",
     "UBER",
@@ -63,8 +70,5 @@
     "XYL",
     "MOMO"
   ],
-  "new_buy_zone": [
-    "NVDA",
-    "PGR"
-  ]
+  "new_buy_zone": []
 }
