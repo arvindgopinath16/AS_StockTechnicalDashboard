@@ -1,55 +1,51 @@
 {
-  "asof": "2026-11-26 04:00 UTC",
+  "asof": "2026-11-27 03:59 UTC",
   "universe": 538,
-  "scored": 519,
+  "scored": 520,
   "r_default": 15.0,
   "top_buy": [
     "NEM",
-    "UBER",
     "DECK",
-    "PGR",
     "MELI",
     "INTU",
     "BSX",
     "XYL",
     "ADBE",
-    "NVDA"
+    "NVDA",
+    "BKNG",
+    "LULU"
   ],
   "top_avoid": [
-    "EXR",
-    "OXY",
-    "RVTY",
-    "CPB",
     "WEC",
-    "RHI",
-    "AEE",
-    "STLD",
-    "CRWD",
-    "SWK"
+    "KIM",
+    "OXY",
+    "EVRG",
+    "CRL",
+    "LW",
+    "WELL",
+    "TFX",
+    "WY",
+    "ED"
   ],
   "trim": [
     "BDX",
     "KIM"
   ],
   "new_buy": [
-    "UBER",
-    "MELI",
-    "ADBE",
-    "NVDA"
+    "BKNG",
+    "LULU"
   ],
   "new_avoid": [
-    "EXR",
-    "RVTY",
-    "CPB",
-    "RHI",
-    "AEE",
-    "STLD",
-    "CRWD",
-    "SWK"
+    "KIM",
+    "EVRG",
+    "CRL",
+    "LW",
+    "WELL",
+    "TFX",
+    "WY",
+    "ED"
   ],
-  "new_trim": [
-    "KIM"
-  ],
+  "new_trim": [],
   "buy_zone": [
     "NVDA",
     "TSM",
